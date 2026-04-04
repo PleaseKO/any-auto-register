@@ -6,6 +6,7 @@ import {
   UserOutlined,
   GlobalOutlined,
   HistoryOutlined,
+  WarningOutlined,
   SettingOutlined,
   SunOutlined,
   MoonOutlined,
@@ -18,6 +19,7 @@ import RegisterTaskPage from '@/pages/RegisterTaskPage'
 import Proxies from '@/pages/Proxies'
 import Settings from '@/pages/Settings'
 import TaskHistory from '@/pages/TaskHistory'
+import FailedAccounts from '@/pages/FailedAccounts'
 import Login from '@/pages/Login'
 import { darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
@@ -92,6 +94,7 @@ function AppContent() {
     if (path === '/') return ['/']
     if (path.startsWith('/accounts')) return [path]
     if (path === '/history') return ['/history']
+    if (path === '/failed') return ['/failed']
     if (path === '/proxies') return ['/proxies']
     if (path === '/settings') return ['/settings']
     return ['/']
@@ -116,6 +119,11 @@ function AppContent() {
       key: '/history',
       icon: <HistoryOutlined />,
       label: '任务历史',
+    },
+    {
+      key: '/failed',
+      icon: <WarningOutlined />,
+      label: '失败记录',
     },
     {
       key: '/proxies',
@@ -231,6 +239,7 @@ function AppContent() {
             <Route path="/accounts/:platform" element={<Accounts />} />
             <Route path="/register" element={<RegisterTaskPage />} />
             <Route path="/history" element={<TaskHistory />} />
+            <Route path="/failed" element={<FailedAccounts />} />
             <Route path="/proxies" element={<Proxies />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>

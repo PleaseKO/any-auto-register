@@ -1,5 +1,5 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 from typing import Optional
@@ -141,6 +141,46 @@ def _save_task_log(
         )
         s.add(log)
         s.commit()
+
+
+def _query_task_logs(
+    *,
+    platform: str | None = None,
+    status: str | None = None,
+    ids: list[int] | None = None,
+):
+    with Session(engine) as s:
+        q = select(TaskLog)
+        if platform:
+            q = q.where(TaskLog.platform == platform)
+        if status:
+            q = q.where(TaskLog.status == status)
+        if ids:
+            q = q.where(TaskLog.id.in_(ids))
+        q = q.order_by(TaskLog.id.desc())
+        return s.exec(q).all()
+
+
+def _build_task_log_detail(
+    task_id: str,
+    req: RegisterTaskRequest,
+    *,
+    proxy: str | None = None,
+    email: str = "",
+    password: str | None = None,
+    error: str = "",
+) -> dict:
+    return {
+        "task_id": task_id,
+        "platform": req.platform,
+        "email": email or req.email or "",
+        "password": password or req.password or "",
+        "proxy": proxy or req.proxy or "",
+        "executor_type": req.executor_type,
+        "captcha_solver": req.captcha_solver,
+        "extra": deepcopy(req.extra or {}),
+        "error": error or "",
+    }
 
 
 def _auto_upload_integrations(task_id: str, account):
@@ -293,7 +333,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if _proxy:
                     proxy_pool.report_success(_proxy)
                 _log(task_id, f"[OK] 注册成功: {account.email}")
-                _save_task_log(req.platform, account.email, "success")
+                _save_task_log(
+                    req.platform,
+                    account.email,
+                    "success",
+                    detail=_build_task_log_detail(
+                        task_id,
+                        req,
+                        proxy=_proxy,
+                        email=account.email,
+                        password=account.password,
+                    ),
+                )
                 _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
@@ -307,6 +358,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     current_email,
                     "skipped",
                     error=str(e),
+                    detail=_build_task_log_detail(
+                        task_id,
+                        req,
+                        proxy=_proxy,
+                        email=current_email,
+                        error=str(e),
+                    ),
                 )
                 return AttemptResult.skipped(str(e))
             except StopTaskRequested as e:
@@ -321,6 +379,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     current_email,
                     "failed",
                     error=str(e),
+                    detail=_build_task_log_detail(
+                        task_id,
+                        req,
+                        proxy=_proxy,
+                        email=current_email,
+                        password=req.password,
+                        error=str(e),
+                    ),
                 )
                 return AttemptResult.failed(str(e))
             finally:
@@ -411,15 +477,102 @@ def stop_task(task_id: str):
 
 
 @router.get("/logs")
-def get_logs(platform: str = None, page: int = 1, page_size: int = 50):
-    with Session(engine) as s:
-        q = select(TaskLog)
-        if platform:
-            q = q.where(TaskLog.platform == platform)
-        q = q.order_by(TaskLog.id.desc())
-        total = len(s.exec(q).all())
-        items = s.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
+def get_logs(
+    platform: str = None,
+    status: str = None,
+    page: int = 1,
+    page_size: int = 50,
+):
+    items_all = _query_task_logs(platform=platform, status=status)
+    total = len(items_all)
+    start = max(page - 1, 0) * page_size
+    items = items_all[start : start + page_size]
     return {"total": total, "items": items}
+
+
+@router.get("/logs/export")
+def export_logs(
+    format: str = "txt",
+    platform: str = None,
+    status: str = "failed",
+    ids: str = "",
+):
+    parsed_ids: list[int] = []
+    if ids:
+        for part in str(ids).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                parsed_ids.append(int(part))
+            except ValueError:
+                raise HTTPException(400, f"无效的日志 ID: {part}")
+
+    items = _query_task_logs(
+        platform=platform,
+        status=status,
+        ids=parsed_ids or None,
+    )
+    if not items:
+        raise HTTPException(404, "没有可导出的记录")
+
+    normalized_format = str(format or "txt").strip().lower()
+    if normalized_format not in {"txt", "json"}:
+        raise HTTPException(400, "仅支持 txt 或 json 导出")
+
+    records = []
+    for item in items:
+        try:
+            detail = json.loads(item.detail_json or "{}")
+        except Exception:
+            detail = {}
+        extra = detail.get("extra") or {}
+        email = str(detail.get("email") or item.email or "").strip()
+        password = str(detail.get("password") or "").strip()
+        client_id = str(
+            extra.get("client_id") or extra.get("clientId") or extra.get("clientID") or ""
+        ).strip()
+        refresh_token = str(
+            extra.get("refresh_token") or extra.get("refreshToken") or ""
+        ).strip()
+        records.append(
+            {
+                "email": email,
+                "password": password,
+                "clientId": client_id,
+                "refreshToken": refresh_token,
+            }
+        )
+
+    if normalized_format == "txt":
+        lines = []
+        for item in records:
+            if not item["email"]:
+                continue
+            parts = [item["email"], item["password"]]
+            if item["clientId"] or item["refreshToken"]:
+                parts.extend([item["clientId"], item["refreshToken"]])
+            lines.append("----".join(parts))
+        content = "\n".join(lines)
+        filename = "failed_accounts_import.txt"
+        media_type = "text/plain; charset=utf-8"
+    else:
+        content = json.dumps(
+            [{k: v for k, v in item.items() if v} for item in records if item["email"]],
+            ensure_ascii=False,
+            indent=2,
+        )
+        filename = "failed_accounts_import.json"
+        media_type = "application/json; charset=utf-8"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.post("/logs/batch-delete")
@@ -453,6 +606,43 @@ def batch_delete_logs(body: TaskLogBatchDeleteRequest):
             s.rollback()
             logger.exception("批量删除任务历史失败")
             raise HTTPException(500, f"批量删除任务历史失败: {str(e)}")
+
+
+@router.post("/logs/{log_id}/retry")
+def retry_failed_log(log_id: int, background_tasks: BackgroundTasks):
+    with Session(engine) as s:
+        log = s.get(TaskLog, log_id)
+        if not log:
+            raise HTTPException(404, "失败记录不存在")
+
+    try:
+        detail = json.loads(log.detail_json or "{}")
+    except Exception:
+        detail = {}
+
+    platform = str(detail.get("platform") or log.platform or "").strip()
+    if not platform:
+        raise HTTPException(400, "失败记录缺少平台信息，无法重试")
+
+    req = RegisterTaskRequest(
+        platform=platform,
+        email=str(detail.get("email") or log.email or "").strip() or None,
+        password=str(detail.get("password") or "").strip() or None,
+        count=1,
+        concurrency=1,
+        register_delay_seconds=0,
+        proxy=str(detail.get("proxy") or "").strip() or None,
+        executor_type=str(detail.get("executor_type") or "protocol").strip() or "protocol",
+        captcha_solver=str(detail.get("captcha_solver") or "yescaptcha").strip() or "yescaptcha",
+        extra=deepcopy(detail.get("extra") or {}),
+    )
+    task_id = enqueue_register_task(
+        req,
+        background_tasks=background_tasks,
+        source="retry_failed_log",
+        meta={"retry_from_log_id": log_id},
+    )
+    return {"ok": True, "task_id": task_id, "log_id": log_id}
 
 
 @router.get("/{task_id}/logs/stream")
