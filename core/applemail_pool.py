@@ -269,3 +269,91 @@ def save_applemail_pool_json(
         "path": str(path),
         "count": len(records),
     }
+
+
+def save_applemail_pool_records(
+    records: list[dict[str, str]],
+    *,
+    pool_dir: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    output_dir = _normalize_pool_dir(pool_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _normalize_filename(filename)
+    path = output_dir / safe_name
+    path.write_text(
+        json.dumps(records, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "filename": safe_name,
+        "path": str(path),
+        "count": len(records),
+    }
+
+
+def export_applemail_pool_content(
+    *,
+    pool_file: str | None = None,
+    pool_dir: str | None = None,
+    fmt: str = "json",
+) -> tuple[str, str]:
+    path, records = load_applemail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
+    fmt = str(fmt or "json").strip().lower()
+    if fmt not in {"json", "txt"}:
+        raise ValueError("fmt 只支持 json 或 txt")
+
+    if fmt == "json":
+        return path.name, json.dumps(records, ensure_ascii=False, indent=2)
+
+    lines: list[str] = []
+    for record in records:
+        email = record.get("email") or ""
+        client_id = record.get("client_id") or ""
+        refresh_token = record.get("refresh_token") or ""
+        mailbox = record.get("mailbox") or "INBOX"
+        password = record.get("password") or ""
+        if not email or not client_id or not refresh_token:
+            continue
+        if password:
+            if mailbox and mailbox != "INBOX":
+                lines.append("----".join([email, password, client_id, refresh_token, mailbox]))
+            else:
+                lines.append("----".join([email, password, client_id, refresh_token]))
+        else:
+            if mailbox and mailbox != "INBOX":
+                lines.append("----".join([email, client_id, refresh_token, mailbox]))
+            else:
+                lines.append("----".join([email, client_id, refresh_token]))
+    return path.stem + ".txt", "\n".join(lines) + ("\n" if lines else "")
+
+
+def list_applemail_pool_files(
+    *,
+    pool_dir: str | None = None,
+    include_count: bool = False,
+) -> list[dict[str, Any]]:
+    base_dir = _normalize_pool_dir(pool_dir)
+    if not base_dir.exists():
+        return []
+    files = sorted(
+        [p for p in base_dir.iterdir() if p.is_file() and p.suffix.lower() in {".json", ".txt", ".csv"}],
+        key=lambda p: (p.stat().st_mtime, p.name),
+        reverse=True,
+    )
+    result: list[dict[str, Any]] = []
+    for p in files:
+        item: dict[str, Any] = {
+            "filename": p.name,
+            "path": str(p),
+            "size": p.stat().st_size,
+            "mtime": int(p.stat().st_mtime),
+        }
+        if include_count:
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                item["count"] = len(parse_applemail_pool_content(content))
+            except Exception:
+                item["count"] = 0
+        result.append(item)
+    return result

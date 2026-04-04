@@ -183,6 +183,59 @@ def _build_task_log_detail(
     }
 
 
+def _best_effort_attempt_state(
+    req: RegisterTaskRequest,
+    *,
+    platform=None,
+    mailbox=None,
+    current_email: str = "",
+    password: str | None = None,
+) -> tuple[str, str, dict]:
+    email_value = str(current_email or req.email or "").strip()
+    password_value = str(password or req.password or "").strip()
+    extra_patch: dict = {}
+
+    if platform is not None:
+        for attr in ("_email", "email"):
+            candidate = str(getattr(platform, attr, "") or "").strip()
+            if candidate and not email_value:
+                email_value = candidate
+                break
+
+        for attr in ("_password", "password"):
+            candidate = str(getattr(platform, attr, "") or "").strip()
+            if candidate and not password_value:
+                password_value = candidate
+                break
+
+        acct = getattr(platform, "_acct", None)
+        acct_email = str(getattr(acct, "email", "") or "").strip()
+        if acct_email and not email_value:
+            email_value = acct_email
+
+    if mailbox is not None:
+        mailbox_email = str(getattr(mailbox, "_email", "") or "").strip()
+        if mailbox_email and not email_value:
+            email_value = mailbox_email
+
+        last_payload = getattr(mailbox, "_last_account_payload", None) or {}
+        payload_email = str(last_payload.get("email") or "").strip()
+        payload_password = str(last_payload.get("password") or "").strip()
+        payload_client_id = str(last_payload.get("client_id") or "").strip()
+        payload_refresh_token = str(last_payload.get("refresh_token") or "").strip()
+
+        if payload_email and not email_value:
+            email_value = payload_email
+        if payload_password and not password_value:
+            password_value = payload_password
+        if payload_client_id:
+            extra_patch["client_id"] = payload_client_id
+        if payload_refresh_token:
+            extra_patch["refresh_token"] = payload_refresh_token
+
+    return email_value, password_value, extra_patch
+
+
 def _auto_upload_integrations(task_id: str, account):
     """注册成功后自动导入外部系统。"""
     try:
@@ -246,6 +299,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             _proxy = None
             current_email = req.email or ""
             attempt_id: int | None = None
+            _mailbox = None
+            _platform = None
             try:
                 from core.proxy_pool import proxy_pool
 
@@ -352,41 +407,57 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     _task_store.add_cashier_url(task_id, cashier_url)
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
+                resolved_email, resolved_password, extra_patch = _best_effort_attempt_state(
+                    req,
+                    platform=_platform,
+                    mailbox=_mailbox,
+                    current_email=current_email,
+                )
                 _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
                 _save_task_log(
                     req.platform,
-                    current_email,
+                    resolved_email,
                     "skipped",
                     error=str(e),
                     detail=_build_task_log_detail(
                         task_id,
                         req,
                         proxy=_proxy,
-                        email=current_email,
+                        email=resolved_email,
+                        password=resolved_password,
                         error=str(e),
-                    ),
+                    )
+                    | {"extra": {**(req.extra or {}), **extra_patch}},
                 )
                 return AttemptResult.skipped(str(e))
             except StopTaskRequested as e:
                 _log(task_id, f"[STOP] {e}")
                 return AttemptResult.stopped(str(e))
             except Exception as e:
+                resolved_email, resolved_password, extra_patch = _best_effort_attempt_state(
+                    req,
+                    platform=_platform,
+                    mailbox=_mailbox,
+                    current_email=current_email,
+                    password=req.password,
+                )
                 if _proxy and proxy_pool is not None:
                     proxy_pool.report_fail(_proxy)
                 _log(task_id, f"[FAIL] 注册失败: {e}")
                 _save_task_log(
                     req.platform,
-                    current_email,
+                    resolved_email,
                     "failed",
                     error=str(e),
                     detail=_build_task_log_detail(
                         task_id,
                         req,
                         proxy=_proxy,
-                        email=current_email,
-                        password=req.password,
+                        email=resolved_email,
+                        password=resolved_password,
                         error=str(e),
-                    ),
+                    )
+                    | {"extra": {**(req.extra or {}), **extra_patch}},
                 )
                 return AttemptResult.failed(str(e))
             finally:

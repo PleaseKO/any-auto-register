@@ -169,6 +169,7 @@ def import_applemail_pool(body: AppleMailImportRequest):
 def get_applemail_pool_snapshot(
     pool_dir: str = "",
     pool_file: str = "",
+    preview_limit: int = 100,
 ):
     from core.applemail_pool import load_applemail_pool_snapshot
 
@@ -178,6 +179,7 @@ def get_applemail_pool_snapshot(
         snapshot = load_applemail_pool_snapshot(
             pool_file=resolved_pool_file,
             pool_dir=resolved_pool_dir,
+            preview_limit=max(1, min(int(preview_limit or 100), 5000)),
         )
     except Exception:
         snapshot = {

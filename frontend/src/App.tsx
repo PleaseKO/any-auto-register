@@ -11,6 +11,7 @@ import {
   SunOutlined,
   MoonOutlined,
   LogoutOutlined,
+  MailOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import Dashboard from '@/pages/Dashboard'
@@ -21,6 +22,8 @@ import Settings from '@/pages/Settings'
 import TaskHistory from '@/pages/TaskHistory'
 import FailedAccounts from '@/pages/FailedAccounts'
 import Login from '@/pages/Login'
+import EmailPool from '@/pages/EmailPool'
+import FailedEmailPool from '@/pages/FailedEmailPool'
 import { darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
 
@@ -97,6 +100,7 @@ function AppContent() {
     if (path === '/failed') return ['/failed']
     if (path === '/proxies') return ['/proxies']
     if (path === '/settings') return ['/settings']
+    if (path.startsWith('/mailpool')) return [path]
     return ['/']
   }
 
@@ -134,6 +138,18 @@ function AppContent() {
       key: '/settings',
       icon: <SettingOutlined />,
       label: '全局配置',
+    },
+    {
+      key: '/mailpool',
+      icon: <MailOutlined />,
+      label: '邮箱池',
+      children: [
+        { key: '/mailpool', label: 'AppleMail 列表' },
+        { key: '/mailpool/import', label: 'AppleMail 导入' },
+        { key: '/mailpool/outlook', label: 'Outlook 列表' },
+        { key: '/mailpool/outlook/import', label: 'Outlook 导入' },
+        { key: '/mailpool/failed', label: '失败邮箱' },
+      ],
     },
   ]
 
@@ -242,6 +258,11 @@ function AppContent() {
             <Route path="/failed" element={<FailedAccounts />} />
             <Route path="/proxies" element={<Proxies />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/mailpool" element={<EmailPool />} />
+            <Route path="/mailpool/import" element={<EmailPool />} />
+            <Route path="/mailpool/outlook" element={<EmailPool />} />
+            <Route path="/mailpool/outlook/import" element={<EmailPool />} />
+            <Route path="/mailpool/failed" element={<FailedEmailPool />} />
           </Routes>
         </Content>
       </Layout>

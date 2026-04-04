@@ -3065,6 +3065,8 @@ class OutlookMailbox(BaseMailbox):
     ):
         self._lock = threading.Lock()
         self._proxy = build_requests_proxy_config(proxy)
+        self._email = None
+        self._last_account_payload = {}
         self._imap_servers = []
         if imap_server:
             self._imap_servers.append(str(imap_server).strip())
@@ -3124,6 +3126,8 @@ class OutlookMailbox(BaseMailbox):
         email = str(payload.get("email") or "").strip()
         if not email:
             raise RuntimeError("Outlook 账号邮箱为空")
+        self._email = email
+        self._last_account_payload = dict(payload)
         self._log(f"[Outlook] 取出账号: {email}（已从本地池移除）")
         return MailboxAccount(
             email=email,
