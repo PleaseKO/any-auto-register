@@ -15,6 +15,7 @@ import {
   Dropdown,
   Typography,
   Alert,
+  DatePicker,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
@@ -60,9 +61,11 @@ function parseExtraJson(raw: string | undefined) {
 function normalizeAccount(account: any) {
   const extra = parseExtraJson(account.extra_json)
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
+  const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
+  const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  return { ...account, extra, cliproxySync, chatgptLocal }
+  return { ...account, extra, cpaSync, sub2apiSync, cliproxySync, chatgptLocal }
 }
 
 function formatSyncTime(value?: string) {
@@ -304,6 +307,40 @@ function cliproxyStateMeta(sync: any) {
   return { color: 'default', label: '未同步' }
 }
 
+function uploadSyncMeta(sync: any) {
+  if (!sync || Object.keys(sync).length === 0) {
+    return { color: 'default', label: '未上传' }
+  }
+  if (sync.uploaded || sync.uploaded_at) {
+    return { color: 'success', label: '已上传' }
+  }
+  if (sync.last_attempt_ok === false) {
+    return { color: 'error', label: '失败' }
+  }
+  if (sync.last_attempt_ok === true || sync.last_attempt_at) {
+    return { color: 'processing', label: '已尝试' }
+  }
+  return { color: 'default', label: '未上传' }
+}
+
+function uploadSyncTitle(name: string, sync: any) {
+  if (!sync || Object.keys(sync).length === 0) {
+    return `${name} 未上传`
+  }
+
+  const parts: string[] = []
+  if (sync.uploaded_at) {
+    parts.push(`成功时间: ${formatSyncTime(sync.uploaded_at)}`)
+  }
+  if (sync.last_attempt_at) {
+    parts.push(`最近尝试: ${formatSyncTime(sync.last_attempt_at)}`)
+  }
+  if (sync.last_message) {
+    parts.push(`结果: ${sync.last_message}`)
+  }
+  return parts.join('\n') || `${name} 已记录状态`
+}
+
 function CliproxySyncSummary({ sync }: { sync: any }) {
   const meta = cliproxyStateMeta(sync)
   return (
@@ -490,6 +527,8 @@ export default function Accounts() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  const [createdAtStart, setCreatedAtStart] = useState('')
+  const [createdAtEnd, setCreatedAtEnd] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
@@ -523,18 +562,27 @@ export default function Accounts() {
   }, [detailModalOpen, currentAccount, detailForm])
 
   const load = useCallback(async () => {
+    if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
+      message.warning('开始时间不能晚于结束时间')
+      setAccounts([])
+      setTotal(0)
+      return
+    }
+
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
+      if (createdAtStart) params.set('created_at_start', createdAtStart)
+      if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
       setAccounts((data.items || []).map(normalizeAccount))
       setTotal(data.total)
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus])
+  }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd])
 
   useEffect(() => {
     load()
@@ -554,22 +602,79 @@ export default function Accounts() {
   const getRefreshToken = (record: any): string => {
     try {
       const extra = JSON.parse(record.extra_json || '{}')
-      return extra.refresh_token || ''
+      return extra.refresh_token || extra.refreshToken || ''
     } catch {
       return ''
     }
   }
 
   const exportCsv = () => {
-    const header = 'email,password,status,region,cashier_url,created_at'
-    const rows = accounts.map((a) => [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].join(','))
-    const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${currentPlatform}_accounts.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+    const quoteCsv = (value: any) => {
+      const text = value == null ? '' : String(value)
+      return `"${text.replace(/"/g, '""')}"`
+    }
+
+    const downloadCsv = (content: string) => {
+      const blob = new Blob([`\uFEFF${content}`], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${currentPlatform}_accounts.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    }
+
+    if (currentPlatform === 'kiro') {
+      const header = ['邮箱', '昵称', '登录方式', 'RefreshToken', 'ClientId', 'ClientSecret', 'Region']
+      const rows = accounts.map((a) => {
+        const nickname = a.extra?.name || String(a.email || '').split('@')[0] || ''
+        const provider = a.extra?.provider || 'BuilderId'
+        const refreshToken = a.extra?.refreshToken || ''
+        const clientId = a.extra?.clientId || ''
+        const clientSecret = a.extra?.clientSecret || ''
+        const region = a.extra?.region || 'us-east-1'
+
+        return [
+          a.email || '',
+          nickname,
+          provider,
+          refreshToken,
+          clientId,
+          clientSecret,
+          region,
+        ].map(quoteCsv).join(',')
+      })
+
+      downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
+      return
+    }
+
+    const header = ['email', 'password', 'status', 'region', 'cashier_url', 'created_at']
+    if (currentPlatform === 'kiro') {
+      header.push('accessToken', 'refreshToken', 'clientId', 'clientSecret')
+    } else if (currentPlatform === 'chatgpt') {
+      header.push('token', 'refresh_token')
+    } else {
+      header.push('token')
+    }
+
+    const rows = accounts.map((a) => {
+      const baseRow = [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].map(quoteCsv)
+      if (currentPlatform === 'kiro') {
+        baseRow.push(quoteCsv(a.extra?.accessToken || a.extra?.webAccessToken || a.token))
+        baseRow.push(quoteCsv(a.extra?.refreshToken))
+        baseRow.push(quoteCsv(a.extra?.clientId))
+        baseRow.push(quoteCsv(a.extra?.clientSecret))
+      } else if (currentPlatform === 'chatgpt') {
+        baseRow.push(quoteCsv(a.token))
+        baseRow.push(quoteCsv(getRefreshToken(a)))
+      } else {
+        baseRow.push(quoteCsv(a.token))
+      }
+      return baseRow.join(',')
+    })
+
+    downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
   }
 
   const handleDelete = async (id: number) => {
@@ -1011,14 +1116,18 @@ export default function Accounts() {
       {
         title: '本地状态',
         key: 'chatgpt_local_state',
-        width: 220,
+        width: 320,
         render: (_: any, record: any) => {
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
           const codex = record.chatgptLocal?.codex || {}
+          const cpaSync = record.cpaSync || {}
+          const sub2apiSync = record.sub2apiSync || {}
           const authMeta = authStateMeta(auth.state)
           const planTag = planMeta(subscription.plan)
           const codexMeta = codexStateMeta(codex.state)
+          const cpaMeta = uploadSyncMeta(cpaSync)
+          const sub2apiMeta = uploadSyncMeta(sub2apiSync)
 
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
@@ -1026,6 +1135,14 @@ export default function Accounts() {
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
                 <Tag color={planTag.color}>{planTag.label}</Tag>
                 <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', cpaSync)}>
+                  CPA {cpaMeta.label}
+                </Tag>
+                <Tag color={sub2apiMeta.color} title={uploadSyncTitle('Sub2API', sub2apiSync)}>
+                  Sub2API {sub2apiMeta.label}
+                </Tag>
               </div>
             </div>
           )
@@ -1152,6 +1269,18 @@ export default function Accounts() {
               { value: 'expired', label: '已过期' },
               { value: 'invalid', label: '已失效' },
             ]}
+          />
+          <DatePicker
+            showTime
+            allowClear
+            placeholder="开始时间"
+            onChange={(value) => setCreatedAtStart(value ? value.toISOString() : '')}
+          />
+          <DatePicker
+            showTime
+            allowClear
+            placeholder="结束时间"
+            onChange={(value) => setCreatedAtEnd(value ? value.toISOString() : '')}
           />
           <Text type="secondary">{total} 个账号</Text>
           {selectedRowKeys.length > 0 && (
@@ -1373,6 +1502,12 @@ export default function Accounts() {
                 </div>
               )
             })()}
+            {currentPlatform === 'kiro' && currentAccount?.extra ? (
+              <DetailSection title="Kiro 客户端信息">
+                <SummaryField label="Client ID" value={currentAccount.extra?.clientId} code />
+                <SummaryField label="Client Secret" value={currentAccount.extra?.clientSecret} code />
+              </DetailSection>
+            ) : null}
             {currentPlatform === 'chatgpt' ? (
               <DetailSection title="本地真实状态">
                 {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
