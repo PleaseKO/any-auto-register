@@ -85,6 +85,7 @@ export default function RegisterTaskPage() {
         cfworker_domain_override: '',
         cfworker_subdomain: cfg.cfworker_subdomain || '',
         cfworker_random_subdomain: parseBooleanConfigValue(cfg.cfworker_random_subdomain),
+        cfworker_random_name_subdomain: parseBooleanConfigValue(cfg.cfworker_random_name_subdomain),
         cfworker_fingerprint: cfg.cfworker_fingerprint || '',
         smstome_cookie: cfg.smstome_cookie || '',
         smstome_country_slugs: cfg.smstome_country_slugs || '',
@@ -146,6 +147,7 @@ export default function RegisterTaskPage() {
       cfworker_domain_override: values.cfworker_domain_override,
       cfworker_subdomain: values.cfworker_subdomain,
       cfworker_random_subdomain: values.cfworker_random_subdomain,
+      cfworker_random_name_subdomain: values.cfworker_random_name_subdomain,
       cfworker_fingerprint: values.cfworker_fingerprint,
       smstome_cookie: values.smstome_cookie,
       smstome_country_slugs: values.smstome_country_slugs,
@@ -469,8 +471,11 @@ export default function RegisterTaskPage() {
               >
                 <Input placeholder="mail / pool-a" />
               </Form.Item>
-              <Form.Item name="cfworker_random_subdomain" label="随机子域名" valuePropName="checked">
+              <Form.Item name="cfworker_random_subdomain" valuePropName="checked">
                 <Checkbox>每次注册前随机生成一层子域名</Checkbox>
+              </Form.Item>
+              <Form.Item name="cfworker_random_name_subdomain" valuePropName="checked">
+                <Checkbox>使用随机姓名作为子域名</Checkbox>
               </Form.Item>
               <Form.Item name="cfworker_fingerprint" label="Fingerprint (可选)">
                 <Input placeholder="cfb82279f..." />

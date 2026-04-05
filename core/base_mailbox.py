@@ -314,6 +314,7 @@ def create_mailbox(
             enabled_domains=extra.get("cfworker_enabled_domains", ""),
             subdomain=extra.get("cfworker_subdomain", ""),
             random_subdomain=extra.get("cfworker_random_subdomain", False),
+            random_name_subdomain=extra.get("cfworker_random_name_subdomain", False),
             fingerprint=extra.get("cfworker_fingerprint", ""),
             custom_auth=extra.get("cfworker_custom_auth", ""),
             proxy=proxy,
@@ -2280,6 +2281,7 @@ class CFWorkerMailbox(BaseMailbox):
         enabled_domains: Any = None,
         subdomain: str = "",
         random_subdomain: Any = False,
+        random_name_subdomain: Any = False,
         fingerprint: str = "",
         custom_auth: str = "",
         proxy: str = None,
@@ -2297,6 +2299,7 @@ class CFWorkerMailbox(BaseMailbox):
             self.enabled_domains = raw_enabled_domains
         self.subdomain = self._normalize_subdomain(subdomain)
         self.random_subdomain = self._to_bool(random_subdomain)
+        self.random_name_subdomain = self._to_bool(random_name_subdomain)
         self.fingerprint = fingerprint
         self.custom_auth = custom_auth
         self.proxy = build_requests_proxy_config(proxy)
@@ -2452,7 +2455,16 @@ class CFWorkerMailbox(BaseMailbox):
             return ""
 
         sub_parts: list[str] = []
-        if self.random_subdomain:
+        if self.random_name_subdomain:
+            try:
+                import names
+                import random
+
+                name_func = random.choice([names.get_first_name, names.get_last_name])
+                sub_parts.append(name_func().lower().replace(" ", ""))
+            except ImportError:
+                sub_parts.append(self._generate_subdomain_label())
+        elif self.random_subdomain:
             sub_parts.append(self._generate_subdomain_label())
         if self.subdomain:
             sub_parts.append(self.subdomain)
