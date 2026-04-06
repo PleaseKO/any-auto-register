@@ -63,9 +63,15 @@ async def lifespan(app: FastAPI):
     from core.registry import list_platforms
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
     from core.scheduler import scheduler
-    scheduler.start()
+    try:
+        scheduler.start()
+    except Exception as exc:
+        print(f"[WARN] 调度器启动失败，已跳过: {exc}")
     from services.solver_manager import start_async
-    start_async()
+    try:
+        start_async()
+    except Exception as exc:
+        print(f"[WARN] Solver 启动失败，已跳过: {exc}")
     yield
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()

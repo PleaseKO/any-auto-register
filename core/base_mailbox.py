@@ -3402,7 +3402,6 @@ class OutlookMailbox(BaseMailbox):
         if not access_token:
             return []
 
-        url = f"{self._graph_api_base}/me/mailFolders/inbox/messages"
         params = {
             "$top": 50,
             "$orderby": "receivedDateTime desc",
@@ -3412,20 +3411,35 @@ class OutlookMailbox(BaseMailbox):
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         }
-        resp = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=30,
-            proxies=self._proxy,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Graph 拉取邮件失败: HTTP {resp.status_code} {resp.text[:160]}")
-        payload = resp.json() if resp.content else {}
-        items = payload.get("value") if isinstance(payload, dict) else []
-        if not isinstance(items, list):
-            return []
-        return [item for item in items if isinstance(item, dict)]
+        collected: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for folder_name in ("inbox", "junkemail"):
+            url = f"{self._graph_api_base}/me/mailFolders/{folder_name}/messages"
+            resp = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=30,
+                proxies=self._proxy,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Graph 拉取邮件失败({folder_name}): HTTP {resp.status_code} {resp.text[:160]}"
+                )
+            payload = resp.json() if resp.content else {}
+            items = payload.get("value") if isinstance(payload, dict) else []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if message_id and message_id in seen_ids:
+                    continue
+                if message_id:
+                    seen_ids.add(message_id)
+                collected.append(item)
+        return collected
 
     def _extract_graph_message_text(self, message: dict[str, Any]) -> str:
         subject = str(message.get("subject") or "").strip()
@@ -3552,12 +3566,22 @@ class OutlookMailbox(BaseMailbox):
         imap_conn = None
         try:
             imap_conn = self._open_imap(account)
-            imap_conn.select("INBOX", readonly=True)
-            status, data = imap_conn.uid("search", None, "ALL")
-            if status != "OK":
-                return set()
-            ids = data[0].split() if data and data[0] else []
-            return {uid.decode("utf-8", errors="ignore") for uid in ids}
+            collected_ids: set[str] = set()
+            for folder in ("INBOX", "Junk", '"Junk Email"', "垃圾邮件"):
+                try:
+                    status, _ = imap_conn.select(folder, readonly=True)
+                except Exception:
+                    continue
+                if status != "OK":
+                    continue
+                status, data = imap_conn.uid("search", None, "ALL")
+                if status != "OK":
+                    continue
+                ids = data[0].split() if data and data[0] else []
+                collected_ids.update(
+                    uid.decode("utf-8", errors="ignore") for uid in ids
+                )
+            return collected_ids
         except Exception:
             return set()
         finally:
@@ -3612,41 +3636,47 @@ class OutlookMailbox(BaseMailbox):
             imap_conn = None
             try:
                 imap_conn = self._open_imap(account)
-                imap_conn.select("INBOX", readonly=True)
-                status, data = imap_conn.uid("search", None, "ALL")
-                if status != "OK":
-                    return None
-                ids = data[0].split() if data and data[0] else []
-                if len(ids) > 50:
-                    ids = ids[-50:]
-                for uid in reversed(ids):
-                    uid_str = (
-                        uid.decode("utf-8", errors="ignore")
-                        if isinstance(uid, bytes)
-                        else str(uid)
-                    )
-                    if not uid_str or uid_str in seen:
+                for folder in ("INBOX", "Junk", '"Junk Email"', "垃圾邮件"):
+                    try:
+                        status, _ = imap_conn.select(folder, readonly=True)
+                    except Exception:
                         continue
-                    seen.add(uid_str)
-                    status, msg_data = imap_conn.uid("fetch", uid, "(RFC822)")
                     if status != "OK":
                         continue
-                    raw = None
-                    for item in msg_data or []:
-                        if isinstance(item, tuple) and item[1]:
-                            raw = item[1]
-                            break
-                    if not raw:
+                    status, data = imap_conn.uid("search", None, "ALL")
+                    if status != "OK":
                         continue
-                    msg = message_from_bytes(raw, policy=email_default_policy)
-                    text = self._extract_message_text(msg)
-                    if keyword_lower and keyword_lower not in text.lower():
-                        continue
-                    code = self._safe_extract(text, code_pattern)
-                    if code:
-                        if code in exclude_codes:
+                    ids = data[0].split() if data and data[0] else []
+                    if len(ids) > 50:
+                        ids = ids[-50:]
+                    for uid in reversed(ids):
+                        uid_str = (
+                            uid.decode("utf-8", errors="ignore")
+                            if isinstance(uid, bytes)
+                            else str(uid)
+                        )
+                        if not uid_str or uid_str in seen:
                             continue
-                        return code
+                        seen.add(uid_str)
+                        status, msg_data = imap_conn.uid("fetch", uid, "(RFC822)")
+                        if status != "OK":
+                            continue
+                        raw = None
+                        for item in msg_data or []:
+                            if isinstance(item, tuple) and item[1]:
+                                raw = item[1]
+                                break
+                        if not raw:
+                            continue
+                        msg = message_from_bytes(raw, policy=email_default_policy)
+                        text = self._extract_message_text(msg)
+                        if keyword_lower and keyword_lower not in text.lower():
+                            continue
+                        code = self._safe_extract(text, code_pattern)
+                        if code:
+                            if code in exclude_codes:
+                                continue
+                            return code
             except Exception:
                 return None
             finally:

@@ -9,6 +9,8 @@ services:
     container_name: any-auto-register
     init: true
     restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     environment:
       HOST: 0.0.0.0
       PORT: "8000"

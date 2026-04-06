@@ -11,7 +11,7 @@ COPY frontend/ ./
 RUN npm run build
 
 
-FROM python:3.12-slim AS runtime
+FROM python:3.11-slim-bookworm AS runtime
 
 ARG CAMOUFOX_VERSION=135.0.1
 ARG CAMOUFOX_RELEASE=beta.24
