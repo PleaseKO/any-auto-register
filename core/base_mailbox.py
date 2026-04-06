@@ -326,6 +326,8 @@ def create_mailbox(
             project_code=extra.get("luckmail_project_code", ""),
             email_type=extra.get("luckmail_email_type", ""),
             domain=extra.get("luckmail_domain", ""),
+            mail_mode=extra.get("luckmail_mail_mode", ""),
+            poll_interval_seconds=extra.get("luckmail_poll_interval_seconds", ""),
             proxy=proxy,
         )
     elif provider == "outlook":
@@ -2761,7 +2763,7 @@ class MoeMailMailbox(BaseMailbox):
 
 
 class LuckMailMailbox(BaseMailbox):
-    """LuckMail 混合模式：ChatGPT 走购买邮箱，其他平台走订单接码"""
+    """LuckMail 邮箱服务：由配置决定使用订单接码或现有已购邮箱"""
 
     def __init__(
         self,
@@ -2770,6 +2772,8 @@ class LuckMailMailbox(BaseMailbox):
         project_code: str = "",
         email_type: str = "",
         domain: str = "",
+        mail_mode: str = "",
+        poll_interval_seconds: Any = "",
         proxy: str = None,
     ):
         if not base_url or not api_key:
@@ -2789,6 +2793,41 @@ class LuckMailMailbox(BaseMailbox):
         self._order_no = None
         self._token = None
         self._email = None
+        normalized_mail_mode = str(mail_mode or "").strip().lower()
+        self._mail_mode = (
+            normalized_mail_mode if normalized_mail_mode in {"existing", "order"} else "existing"
+        )
+        self._poll_interval_seconds = self._resolve_poll_interval_seconds(
+            poll_interval_seconds
+        )
+
+    def _resolve_poll_interval_seconds(self, value: Any, default: float = 5.0) -> float:
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return default
+        if resolved <= 0:
+            return default
+        return max(1.0, resolved)
+
+    def _is_rate_limited_error(self, error: Exception) -> bool:
+        if error is None:
+            return False
+        code = getattr(error, "code", None)
+        if code == 429:
+            return True
+        message = str(error or "").lower()
+        return (
+            "429" in message
+            or "too many requests" in message
+            or "请求过于频繁" in message
+            or "rate limit" in message
+        )
+
+    def _get_rate_limit_backoff_seconds(self, retry_count: int) -> float:
+        schedule = (8.0, 15.0, 30.0, 45.0)
+        index = max(0, min(int(retry_count or 1) - 1, len(schedule) - 1))
+        return schedule[index]
 
     def _select_existing_purchase(self) -> Optional[dict]:
         try:
@@ -2815,16 +2854,12 @@ class LuckMailMailbox(BaseMailbox):
             }
         return None
 
-    def _use_purchase_mode(self, account: MailboxAccount = None) -> bool:
-        if (
-            account
-            and account.account_id
-            and str(account.account_id).startswith("tok_")
-        ):
+    def _use_existing_purchase_mode(self, account: MailboxAccount = None) -> bool:
+        if account and account.account_id and str(account.account_id).startswith("tok_"):
             return True
         if self._token:
             return True
-        return self._project_code == "openai"
+        return self._mail_mode == "existing"
 
     def _resolve_token(self, account: MailboxAccount = None) -> str:
         token = (account.account_id if account else "") or self._token
@@ -2898,39 +2933,14 @@ class LuckMailMailbox(BaseMailbox):
         if not self._project_code:
             raise RuntimeError("LuckMail 未设置 project_code，无法创建邮箱")
 
-        if self._use_purchase_mode():
+        if self._use_existing_purchase_mode():
             self._log(
-                f"[LuckMail] 分支: ChatGPT + LuckMail -> 购买邮箱接口 "
+                f"[LuckMail] 模式: 已购邮箱 "
                 f"(project_code={self._project_code}, email_type={self._email_type or '-'}, domain={self._domain or '-'})"
             )
-            result = None
-            try:
-                result = self._client.user.purchase_emails(
-                    project_code=self._project_code,
-                    quantity=1,
-                    email_type=self._email_type,
-                    domain=self._domain,
-                )
-            except Exception as e:
-                self._log(f"[LuckMail] 购买邮箱失败，尝试回退已购邮箱池: {e}")
-
-            purchases = (result or {}).get("purchases") or []
-            fallback_reason = ""
-            if not purchases:
-                fallback_reason = (
-                    f"LuckMail 购买邮箱失败或返回为空，尝试回退已购邮箱池: {result}"
-                )
-                self._log(f"[LuckMail] {fallback_reason}")
-                existing = self._select_existing_purchase()
-                if existing:
-                    purchases = [existing]
-                    self._log(
-                        "[LuckMail] 已从账号现有已购邮箱池回退获取可用邮箱"
-                    )
-                else:
-                    raise RuntimeError(fallback_reason)
-
-            item = purchases[0]
+            item = self._select_existing_purchase()
+            if not item:
+                raise RuntimeError("LuckMail 已购邮箱池为空或没有可用邮箱")
             email = str(item.get("email_address") or "").strip()
             token = str(item.get("token") or "").strip()
             if not email or not token:
@@ -2952,7 +2962,7 @@ class LuckMailMailbox(BaseMailbox):
             )
 
         self._log(
-            f"[LuckMail] 分支: 其他平台 + LuckMail -> 创建订单/订单接码 "
+            f"[LuckMail] 模式: 订单接码 "
             f"(project_code={self._project_code}, email_type={self._email_type or '-'})"
         )
         try:
@@ -2970,7 +2980,7 @@ class LuckMailMailbox(BaseMailbox):
         return MailboxAccount(email=email, account_id=order.order_no)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        if not self._use_purchase_mode(account):
+        if not self._use_existing_purchase_mode(account):
             return set()
         token = self._resolve_token(account)
         if not token:
@@ -2990,11 +3000,13 @@ class LuckMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        if not self._use_purchase_mode(account):
+        if not self._use_existing_purchase_mode(account):
             self._log("[LuckMail] 等验证码分支: 订单接码")
             order_no = account.account_id or self._order_no
             if not order_no:
                 raise RuntimeError("LuckMail 未创建订单，无法等待验证码")
+            poll_interval = self._poll_interval_seconds
+            rate_limit_retries = 0
 
             def on_poll_order(result):
                 self._log(f"[LuckMail] 轮询中... 状态: {result.status}")
@@ -3005,15 +3017,30 @@ class LuckMailMailbox(BaseMailbox):
                 while time.monotonic() < deadline:
                     self._checkpoint()
                     remaining = max(1, int(deadline - time.monotonic()))
-                    slice_timeout = min(remaining, 6)
+                    slice_timeout = min(
+                        remaining,
+                        max(6, int(poll_interval) + 2),
+                    )
                     try:
                         code_result = self._client.user._sync_wait_for_code(
                             order_no=order_no,
                             timeout=slice_timeout,
-                            interval=3.0,
+                            interval=poll_interval,
                             on_poll=on_poll_order,
                         )
                     except Exception as e:
+                        if self._is_rate_limited_error(e):
+                            rate_limit_retries += 1
+                            backoff_seconds = min(
+                                self._get_rate_limit_backoff_seconds(rate_limit_retries),
+                                max(1.0, deadline - time.monotonic()),
+                            )
+                            self._log(
+                                f"[LuckMail] 命中 429 限流，退避等待 {backoff_seconds:.0f}s 后重试..."
+                            )
+                            if backoff_seconds > 0:
+                                self._sleep_with_checkpoint(backoff_seconds)
+                            continue
                         raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
 
                     last_status = str(code_result.status or "pending")
@@ -3021,6 +3048,7 @@ class LuckMailMailbox(BaseMailbox):
                         code = code_result.verification_code
                         self._log(f"[LuckMail] 收到验证码: {code}")
                         return code
+                    rate_limit_retries = 0
                     if code_result.status in {"cancelled", "timeout"}:
                         break
             except Exception:
@@ -3036,6 +3064,8 @@ class LuckMailMailbox(BaseMailbox):
         if not token:
             raise RuntimeError("LuckMail 未找到已购邮箱 Token，无法等待验证码")
         self._log("[LuckMail] 等验证码分支: 已购邮箱 Token 收码")
+        poll_interval = self._poll_interval_seconds
+        rate_limit_retries = 0
 
         exclude_codes = {
             str(code) for code in (kwargs.get("exclude_codes") or set()) if code
@@ -3051,12 +3081,23 @@ class LuckMailMailbox(BaseMailbox):
         saw_new_mail = False
 
         def poll_once() -> Optional[str]:
-            nonlocal saw_new_mail
+            nonlocal saw_new_mail, rate_limit_retries
             found_new_mail = False
             try:
                 mail_list = self._client.user.get_token_mails(token)
             except Exception as e:
+                if self._is_rate_limited_error(e):
+                    rate_limit_retries += 1
+                    backoff_seconds = self._get_rate_limit_backoff_seconds(
+                        rate_limit_retries
+                    )
+                    self._log(
+                        f"[LuckMail] 命中 429 限流，退避等待 {backoff_seconds:.0f}s 后重试..."
+                    )
+                    self._sleep_with_checkpoint(backoff_seconds)
+                    return None
                 raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+            rate_limit_retries = 0
 
             for mail in mail_list.mails:
                 message_id = str(mail.message_id or "").strip()
@@ -3095,7 +3136,7 @@ class LuckMailMailbox(BaseMailbox):
 
         return self._run_polling_wait(
             timeout=timeout,
-            poll_interval=3,
+            poll_interval=poll_interval,
             poll_once=poll_once,
             timeout_message=(
                 f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: "

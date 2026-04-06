@@ -15,6 +15,7 @@ class LuckMailMailboxTests(unittest.TestCase):
         mailbox._order_no = None
         mailbox._token = "tok_demo"
         mailbox._email = "demo@example.com"
+        mailbox._mail_mode = "existing"
         mailbox._log_fn = None
         return mailbox
 
@@ -80,11 +81,21 @@ class LuckMailMailboxTests(unittest.TestCase):
             "socks5://127.0.0.1:7890",
         )
 
-    def test_get_email_falls_back_to_existing_purchases_when_purchase_api_fails(self):
+    @mock.patch("core.luckmail.LuckMailClient")
+    def test_mailbox_constructor_accepts_cached_mail_mode(self, mock_client_cls):
+        mailbox = LuckMailMailbox(
+            base_url="https://example.com",
+            api_key="k",
+            project_code="openai",
+            mail_mode="existing",
+        )
+
+        self.assertEqual(mailbox._mail_mode, "existing")
+
+    def test_get_email_uses_existing_purchase_mode(self):
         mailbox = self._build_mailbox()
         mailbox._token = None
         mailbox._email = None
-        mailbox._client.user.purchase_emails.side_effect = RuntimeError("无库存")
         mailbox._client.user.get_purchases.return_value = PageResult(
             list=[
                 PurchaseItem(
@@ -107,12 +118,12 @@ class LuckMailMailboxTests(unittest.TestCase):
         self.assertEqual(account.account_id, "tok_fallback")
         self.assertEqual(mailbox._token, "tok_fallback")
         self.assertEqual(mailbox._email, "fallback@example.com")
+        mailbox._client.user.purchase_emails.assert_not_called()
 
-    def test_get_email_raises_when_purchase_api_fails_and_no_existing_purchase(self):
+    def test_get_email_raises_when_no_existing_purchase(self):
         mailbox = self._build_mailbox()
         mailbox._token = None
         mailbox._email = None
-        mailbox._client.user.purchase_emails.side_effect = RuntimeError("无库存")
         mailbox._client.user.get_purchases.return_value = PageResult(
             list=[],
             total=0,
@@ -123,7 +134,15 @@ class LuckMailMailboxTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             mailbox.get_email()
 
-        self.assertIn("回退已购邮箱池", str(ctx.exception))
+        self.assertIn("已购邮箱池为空", str(ctx.exception))
+
+    def test_use_existing_purchase_mode_respects_explicit_config(self):
+        mailbox = self._build_mailbox()
+        mailbox._token = ""
+        mailbox._mail_mode = "order"
+
+        self.assertFalse(mailbox._use_existing_purchase_mode())
+        self.assertEqual(mailbox._mail_mode, "order")
 
 
 if __name__ == "__main__":

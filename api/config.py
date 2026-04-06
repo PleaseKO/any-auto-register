@@ -67,8 +67,10 @@ CONFIG_KEYS = [
     "smstome_sync_max_pages_per_country",
     "luckmail_base_url",
     "luckmail_api_key",
+    "luckmail_mail_mode",
     "luckmail_email_type",
     "luckmail_domain",
+    "luckmail_poll_interval_seconds",
     "cpa_enabled",
     "cpa_api_url",
     "cpa_api_key",
@@ -126,6 +128,10 @@ def get_config():
         all_cfg["gptmail_base_url"] = "https://mail.chatgpt.org.uk"
     if not all_cfg.get("luckmail_base_url"):
         all_cfg["luckmail_base_url"] = "https://mails.luckyous.com/"
+    if not all_cfg.get("luckmail_mail_mode"):
+        all_cfg["luckmail_mail_mode"] = "existing"
+    if not all_cfg.get("luckmail_poll_interval_seconds"):
+        all_cfg["luckmail_poll_interval_seconds"] = "5"
     if not all_cfg.get("contribution_server_url"):
         all_cfg["contribution_server_url"] = "http://new.xem8k5.top:7317/"
     # 只返回已知 key，未设置的返回空字符串

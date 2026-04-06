@@ -102,8 +102,10 @@ export default function RegisterTaskPage() {
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
         luckmail_base_url: cfg.luckmail_base_url || 'https://mails.luckyous.com/',
         luckmail_api_key: cfg.luckmail_api_key || '',
+        luckmail_mail_mode: cfg.luckmail_mail_mode || 'existing',
         luckmail_email_type: cfg.luckmail_email_type || '',
         luckmail_domain: cfg.luckmail_domain || '',
+        luckmail_poll_interval_seconds: cfg.luckmail_poll_interval_seconds || '5',
       })
     })
   }, [form])
@@ -183,8 +185,10 @@ export default function RegisterTaskPage() {
       smstome_sync_max_pages_per_country: values.smstome_sync_max_pages_per_country,
       luckmail_base_url: values.luckmail_base_url,
       luckmail_api_key: values.luckmail_api_key,
+      luckmail_mail_mode: values.luckmail_mail_mode,
       luckmail_email_type: values.luckmail_email_type,
       luckmail_domain: values.luckmail_domain,
+      luckmail_poll_interval_seconds: values.luckmail_poll_interval_seconds,
       outlook_source_tag_filter: values.outlook_only_failed_reimport ? 'failed_reimport' : '',
       yescaptcha_key: values.yescaptcha_key,
       solver_url: values.solver_url,
@@ -558,11 +562,22 @@ export default function RegisterTaskPage() {
               <Form.Item name="luckmail_api_key" label="API Key">
                 <Input.Password placeholder="ak_..." />
               </Form.Item>
+              <Form.Item name="luckmail_mail_mode" label="邮箱模式">
+                <Select
+                  options={[
+                    { label: '已购邮箱', value: 'existing' },
+                    { label: '订单接码', value: 'order' },
+                  ]}
+                />
+              </Form.Item>
               <Form.Item name="luckmail_email_type" label="邮箱类型（可选）">
                 <Input placeholder="ms_graph / ms_imap" />
               </Form.Item>
               <Form.Item name="luckmail_domain" label="邮箱域名（可选）">
                 <Input placeholder="outlook.com" />
+              </Form.Item>
+              <Form.Item name="luckmail_poll_interval_seconds" label="轮询间隔秒数">
+                <Input placeholder="5" />
               </Form.Item>
             </>
           )}

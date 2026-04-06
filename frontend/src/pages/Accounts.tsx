@@ -54,6 +54,10 @@ const STATUS_COLORS: Record<string, string> = {
   invalid: 'error',
 }
 
+function isFinalTaskStatus(status?: string) {
+  return status === 'done' || status === 'failed' || status === 'stopped'
+}
+
 function parseExtraJson(raw: string | undefined) {
   if (!raw) return {}
   try {
@@ -810,8 +814,10 @@ export default function Accounts() {
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
         luckmail_base_url: cfg.luckmail_base_url,
         luckmail_api_key: cfg.luckmail_api_key,
+        luckmail_mail_mode: cfg.luckmail_mail_mode,
         luckmail_email_type: cfg.luckmail_email_type,
         luckmail_domain: cfg.luckmail_domain,
+        luckmail_poll_interval_seconds: cfg.luckmail_poll_interval_seconds || '5',
       }
       const chatgptRegistrationRequestAdapter =
         buildChatGPTRegistrationRequestAdapter(
@@ -843,9 +849,10 @@ export default function Accounts() {
       const interval = setInterval(async () => {
         const t = await apiFetch(`/tasks/${res.task_id}`)
         setRegisterTask(t)
-        if (t.status === 'done' || t.status === 'failed' || t.status === 'stopped') {
+        if (isFinalTaskStatus(String(t?.status || ''))) {
           clearInterval(interval)
           setRegisterTaskPolling(false)
+          persistRegisterTaskSnapshot(null, currentPlatform)
           load()
         }
       }, 2000)
@@ -855,6 +862,9 @@ export default function Accounts() {
   }
 
   const closeRegisterModal = () => {
+    if (isFinalTaskStatus(String(registerTask?.status || ''))) {
+      resetRegisterTaskState()
+    }
     setRegisterModalOpen(false)
   }
 
@@ -884,9 +894,12 @@ export default function Accounts() {
           setTaskId(savedTaskId)
           setRegisterTask(t)
           setRegisterLogVisible(true)
-          const finished = ['done', 'failed', 'stopped'].includes(String(t?.status || ''))
+          const finished = isFinalTaskStatus(String(t?.status || ''))
           setRegisterTaskPolling(!finished)
-          if (finished) return
+          if (finished) {
+            persistRegisterTaskSnapshot(null, currentPlatform)
+            return
+          }
 
           const interval = setInterval(async () => {
             const nextTask = await apiFetch(`/tasks/${savedTaskId}`)
@@ -895,9 +908,10 @@ export default function Accounts() {
               return
             }
             setRegisterTask(nextTask)
-            if (['done', 'failed', 'stopped'].includes(String(nextTask?.status || ''))) {
+            if (isFinalTaskStatus(String(nextTask?.status || ''))) {
               clearInterval(interval)
               setRegisterTaskPolling(false)
+              persistRegisterTaskSnapshot(null, currentPlatform)
               load()
             }
           }, 2000)
@@ -1543,6 +1557,14 @@ export default function Accounts() {
             )}
             <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <Button onClick={closeRegisterModal}>关闭弹窗</Button>
+              {isFinalTaskStatus(String(registerTask?.status || '')) ? (
+                <Button
+                  type="primary"
+                  onClick={resetRegisterTaskState}
+                >
+                  重新发起注册
+                </Button>
+              ) : null}
               <Button danger onClick={resetRegisterTaskState}>清空当前任务视图</Button>
             </div>
           </>
