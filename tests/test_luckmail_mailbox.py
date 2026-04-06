@@ -3,6 +3,7 @@ from unittest import mock
 
 from core.base_mailbox import LuckMailMailbox, MailboxAccount, create_mailbox
 from core.luckmail.models import PageResult, PurchaseItem, TokenMailItem, TokenMailList
+from core.task_runtime import RegisterTaskControl
 
 
 class LuckMailMailboxTests(unittest.TestCase):
@@ -17,6 +18,7 @@ class LuckMailMailboxTests(unittest.TestCase):
         mailbox._email = "demo@example.com"
         mailbox._mail_mode = "existing"
         mailbox._log_fn = None
+        mailbox._task_control = None
         return mailbox
 
     @mock.patch("time.sleep", return_value=None)
@@ -143,6 +145,46 @@ class LuckMailMailboxTests(unittest.TestCase):
 
         self.assertFalse(mailbox._use_existing_purchase_mode())
         self.assertEqual(mailbox._mail_mode, "order")
+
+    def test_get_email_skips_task_used_existing_purchase(self):
+        mailbox = self._build_mailbox()
+        mailbox._token = None
+        mailbox._email = None
+        mailbox._task_control = RegisterTaskControl()
+        self.assertTrue(
+            mailbox._task_control.reserve_luckmail_purchase(
+                token="tok_used",
+                email="used@example.com",
+            )
+        )
+        mailbox._client.user.get_purchases.return_value = PageResult(
+            list=[
+                PurchaseItem(
+                    id=1,
+                    email_address="used@example.com",
+                    token="tok_used",
+                    project_name="openai",
+                    price="0.0000",
+                    user_disabled=0,
+                ),
+                PurchaseItem(
+                    id=2,
+                    email_address="fresh@example.com",
+                    token="tok_fresh",
+                    project_name="openai",
+                    price="0.0000",
+                    user_disabled=0,
+                ),
+            ],
+            total=2,
+            page=1,
+            page_size=100,
+        )
+
+        account = mailbox.get_email()
+
+        self.assertEqual(account.email, "fresh@example.com")
+        self.assertEqual(account.account_id, "tok_fresh")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,8 @@ class RegisterTaskControl:
         self._next_attempt_id = 1
         self._active_attempt_ids: set[int] = set()
         self._skip_active_attempt_ids: set[int] = set()
+        self._used_luckmail_tokens: set[str] = set()
+        self._used_luckmail_emails: set[str] = set()
 
     def request_stop(self) -> None:
         with self._lock:
@@ -116,6 +118,22 @@ class RegisterTaskControl:
         with self._lock:
             return self._stop_requested
 
+    def reserve_luckmail_purchase(self, *, token: str = "", email: str = "") -> bool:
+        normalized_token = str(token or "").strip()
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_token and not normalized_email:
+            return False
+        with self._lock:
+            if normalized_token and normalized_token in self._used_luckmail_tokens:
+                return False
+            if normalized_email and normalized_email in self._used_luckmail_emails:
+                return False
+            if normalized_token:
+                self._used_luckmail_tokens.add(normalized_token)
+            if normalized_email:
+                self._used_luckmail_emails.add(normalized_email)
+            return True
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -123,6 +141,7 @@ class RegisterTaskControl:
                 "pending_skip_requests": self._pending_skip_requests,
                 "active_attempts": len(self._active_attempt_ids),
                 "targeted_skip_attempts": len(self._skip_active_attempt_ids),
+                "used_luckmail_purchases": len(self._used_luckmail_tokens),
             }
 
 

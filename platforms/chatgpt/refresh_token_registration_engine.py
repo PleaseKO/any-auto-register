@@ -248,6 +248,18 @@ class RefreshTokenRegistrationEngine:
         )
         return any(marker in text for marker in markers)
 
+    @staticmethod
+    def _should_skip_existing_email(message: str) -> bool:
+        text = str(message or "").lower()
+        markers = (
+            "user_already_exists",
+            "account already exists",
+            "please login instead",
+            "邮箱已注册",
+            "已注册",
+        )
+        return any(marker in text for marker in markers)
+
     def _build_chatgpt_client(self) -> ChatGPTClient:
         client = ChatGPTClient(
             proxy=self.proxy_url,
@@ -441,6 +453,10 @@ class RefreshTokenRegistrationEngine:
             )
 
             if not registered:
+                if self._should_skip_existing_email(registration_message):
+                    result.error_message = f"邮箱已注册，跳过: {registration_message}"
+                    return result
+
                 if not self._should_switch_to_login_after_register_failure(
                     registration_message
                 ):

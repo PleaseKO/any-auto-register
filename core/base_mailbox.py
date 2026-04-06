@@ -2829,6 +2829,15 @@ class LuckMailMailbox(BaseMailbox):
         index = max(0, min(int(retry_count or 1) - 1, len(schedule) - 1))
         return schedule[index]
 
+    def _reserve_existing_purchase(self, *, token: str = "", email: str = "") -> bool:
+        task_control = getattr(self, "_task_control", None)
+        if task_control is None:
+            return True
+        reserve = getattr(task_control, "reserve_luckmail_purchase", None)
+        if not callable(reserve):
+            return True
+        return bool(reserve(token=token, email=email))
+
     def _select_existing_purchase(self) -> Optional[dict]:
         try:
             purchases = self._client.user.get_purchases(
@@ -2845,6 +2854,9 @@ class LuckMailMailbox(BaseMailbox):
             if not email or not token:
                 continue
             if int(getattr(item, "user_disabled", 0) or 0) != 0:
+                continue
+            if not self._reserve_existing_purchase(token=token, email=email):
+                self._log(f"[LuckMail] 跳过本任务已使用邮箱: {email}")
                 continue
             return {
                 "email_address": email,

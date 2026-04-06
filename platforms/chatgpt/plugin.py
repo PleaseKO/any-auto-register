@@ -6,6 +6,7 @@ import string
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
 from core.registry import register
+from core.task_runtime import SkipCurrentAttemptRequested
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
@@ -37,6 +38,17 @@ class ChatGPTPlatform(BasePlatform):
             return status not in ("expired", "invalid", "banned", None)
         except Exception:
             return False
+
+    @staticmethod
+    def _should_skip_existing_email(error_message: str) -> bool:
+        text = str(error_message or "").lower()
+        markers = (
+            "邮箱已注册",
+            "user_already_exists",
+            "account already exists",
+            "please login instead",
+        )
+        return any(marker in text for marker in markers)
 
     def register(self, email: str = None, password: str = None) -> Account:
         if not password:
@@ -194,7 +206,10 @@ class ChatGPTPlatform(BasePlatform):
         )
         result = adapter.run(context)
         if not result or not result.success:
-            raise RuntimeError(result.error_message if result else "注册失败")
+            error_message = result.error_message if result else "注册失败"
+            if self._should_skip_existing_email(error_message):
+                raise SkipCurrentAttemptRequested(error_message)
+            raise RuntimeError(error_message)
 
         return adapter.build_account(result, password)
 
