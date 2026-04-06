@@ -855,6 +855,17 @@ class ChatGPTClient:
             self._log(f"验证异常: {e}")
             return False, str(e)
 
+    @staticmethod
+    def _is_wrong_email_otp_error(detail) -> bool:
+        text = str(detail or "").strip().lower()
+        markers = (
+            "wrong_email_otp_code",
+            "wrong code",
+            "验证码错误",
+            "otp 无效",
+        )
+        return any(marker in text for marker in markers)
+
     def create_account(self, first_name, last_name, birthdate, return_state=False):
         """
         完成账号创建（提交姓名和生日）
@@ -1040,6 +1051,7 @@ class ChatGPTClient:
         otp_verified = False
         account_created = False
         seen_states = {}
+        tried_otp_codes: set[str] = set()
 
         otp_send_attempts = 0
 
@@ -1081,34 +1093,48 @@ class ChatGPTClient:
             if self._state_is_email_otp(state):
                 self._enter_stage("otp", describe_flow_state(state))
                 self._log("等待邮箱验证码...")
-                otp_code = skymail_client.wait_for_verification_code(
-                    email, timeout=otp_wait_timeout
-                )
-                if not otp_code:
-                    self._log(
-                        "首次等待未收到验证码，尝试重发一次 email-otp/send "
-                        f"后再等待 {otp_resend_wait_timeout}s"
-                    )
-                    otp_send_attempts += 1
-                    resend_ok = self.send_email_otp(
-                        referer=state.current_url or state.continue_url or f"{self.AUTH}/email-verification"
-                    )
-                    if resend_ok:
-                        self._log(f"重发验证码成功: attempt={otp_send_attempts}")
-                    else:
-                        self._log(f"重发验证码失败: attempt={otp_send_attempts}")
+                has_resent = False
+                while True:
                     otp_code = skymail_client.wait_for_verification_code(
-                        email, timeout=otp_resend_wait_timeout
+                        email,
+                        timeout=(otp_resend_wait_timeout if has_resent else otp_wait_timeout),
+                        exclude_codes=tried_otp_codes,
                     )
-                if not otp_code:
-                    return False, "未收到验证码"
+                    if not otp_code:
+                        if has_resent:
+                            return False, "未收到验证码"
+                        self._log(
+                            "首次等待未收到验证码，尝试重发一次 email-otp/send "
+                            f"后再等待 {otp_resend_wait_timeout}s"
+                        )
+                        otp_send_attempts += 1
+                        resend_ok = self.send_email_otp(
+                            referer=state.current_url or state.continue_url or f"{self.AUTH}/email-verification"
+                        )
+                        if resend_ok:
+                            self._log(f"重发验证码成功: attempt={otp_send_attempts}")
+                        else:
+                            self._log(f"重发验证码失败: attempt={otp_send_attempts}")
+                        has_resent = True
+                        continue
 
-                success, next_state = self.verify_email_otp(otp_code, return_state=True)
-                if not success:
+                    tried_otp_codes.add(str(otp_code).strip())
+
+                    success, next_state = self.verify_email_otp(otp_code, return_state=True)
+                    if success:
+                        otp_verified = True
+                        state = next_state
+                        self.last_registration_state = state
+                        break
+
+                    if self._is_wrong_email_otp_error(next_state):
+                        self._log(
+                            f"验证码 {otp_code} 无效，继续等待新的验证码..."
+                        )
+                        has_resent = True
+                        continue
+
                     return False, f"验证码失败: {next_state}"
-                otp_verified = True
-                state = next_state
-                self.last_registration_state = state
                 continue
 
             if self._state_is_about_you(state):

@@ -3198,8 +3198,10 @@ class OutlookMailbox(BaseMailbox):
             self._imap_port = 993
         self._token_endpoint = str(token_endpoint or "").strip()
         self._source_tag_filter = str(source_tag_filter or "").strip().lower()
+        self._graph_api_base = "https://graph.microsoft.com/v1.0"
+        self._account_wait_poll_interval = 5.0
 
-    def _pop_account(self) -> dict:
+    def _try_pop_account(self) -> Optional[dict]:
         from sqlmodel import Session, select
         from core.db import engine, OutlookAccountModel
 
@@ -3224,11 +3226,7 @@ class OutlookMailbox(BaseMailbox):
                     ).first()
                 )
                 if not account:
-                    if self._source_tag_filter:
-                        raise RuntimeError(
-                            f"未找到标签为 {self._source_tag_filter} 的 Outlook 账号，请先导入对应邮箱"
-                        )
-                    raise RuntimeError("Outlook 账号池为空，请先在设置页批量导入")
+                    return None
 
                 payload = {
                     "id": account.id,
@@ -3243,7 +3241,22 @@ class OutlookMailbox(BaseMailbox):
                 return payload
 
     def get_email(self) -> MailboxAccount:
-        payload = self._pop_account()
+        logged_waiting = False
+        while True:
+            self._checkpoint()
+            payload = self._try_pop_account()
+            if payload:
+                break
+            if not logged_waiting:
+                if self._source_tag_filter:
+                    self._log(
+                        f"[Outlook] 未找到标签为 {self._source_tag_filter} 的账号，等待补号中..."
+                    )
+                else:
+                    self._log("[Outlook] 账号池为空，等待补号中...")
+                logged_waiting = True
+            self._sleep_with_checkpoint(self._account_wait_poll_interval)
+
         email = str(payload.get("email") or "").strip()
         if not email:
             raise RuntimeError("Outlook 账号邮箱为空")
@@ -3320,6 +3333,107 @@ class OutlookMailbox(BaseMailbox):
             except Exception:
                 continue
         return ""
+
+    def _fetch_graph_access_token(
+        self, *, email: str, client_id: str, refresh_token: str
+    ) -> str:
+        if not client_id or not refresh_token:
+            return ""
+        import requests
+
+        scope_candidates = [
+            "https://graph.microsoft.com/Mail.Read offline_access",
+            "Mail.Read offline_access",
+            "https://graph.microsoft.com/.default",
+        ]
+        endpoint_candidates = []
+        if self._token_endpoint:
+            endpoint_candidates.append(self._token_endpoint)
+        endpoint_candidates.extend(
+            [
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                "https://login.live.com/oauth20_token.srf",
+            ]
+        )
+
+        for endpoint in endpoint_candidates:
+            endpoint = str(endpoint or "").strip()
+            if not endpoint:
+                continue
+            for scope in scope_candidates:
+                payload = {
+                    "client_id": client_id,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                }
+                if scope:
+                    payload["scope"] = scope
+                try:
+                    resp = requests.post(
+                        endpoint,
+                        data=payload,
+                        timeout=20,
+                        proxies=self._proxy,
+                    )
+                    if resp.status_code >= 400:
+                        continue
+                    data = resp.json() if resp.content else {}
+                    access_token = str(data.get("access_token") or "").strip()
+                    if access_token:
+                        self._log(f"[Outlook] Graph access token 获取成功: {email}")
+                        return access_token
+                except Exception:
+                    continue
+        return ""
+
+    def _graph_list_messages(self, account: MailboxAccount) -> list[dict[str, Any]]:
+        import requests
+
+        email_addr = str(account.email or "").strip()
+        extra = account.extra or {}
+        client_id = str(extra.get("client_id") or "").strip()
+        refresh_token = str(extra.get("refresh_token") or "").strip()
+        access_token = self._fetch_graph_access_token(
+            email=email_addr,
+            client_id=client_id,
+            refresh_token=refresh_token,
+        )
+        if not access_token:
+            return []
+
+        url = f"{self._graph_api_base}/me/mailFolders/inbox/messages"
+        params = {
+            "$top": 50,
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,bodyPreview,receivedDateTime,from,body",
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        }
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=30,
+            proxies=self._proxy,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Graph 拉取邮件失败: HTTP {resp.status_code} {resp.text[:160]}")
+        payload = resp.json() if resp.content else {}
+        items = payload.get("value") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def _extract_graph_message_text(self, message: dict[str, Any]) -> str:
+        subject = str(message.get("subject") or "").strip()
+        preview = str(message.get("bodyPreview") or "").strip()
+        body = message.get("body") if isinstance(message.get("body"), dict) else {}
+        content = str(body.get("content") or "").strip()
+        combined = " ".join(part for part in (subject, preview, content) if part)
+        return self._decode_raw_content(combined)
 
     def _imap_auth_oauth(self, imap_conn, *, email: str, access_token: str) -> None:
         auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
@@ -3424,6 +3538,17 @@ class OutlookMailbox(BaseMailbox):
         return self._decode_raw_content(combined)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
+        extra = account.extra or {}
+        if str(extra.get("client_id") or "").strip() and str(extra.get("refresh_token") or "").strip():
+            try:
+                messages = self._graph_list_messages(account)
+                ids = {str(item.get("id") or "").strip() for item in messages if str(item.get("id") or "").strip()}
+                if ids:
+                    self._log(f"[Outlook] Graph 读取当前邮件 ID 成功: {account.email}")
+                    return ids
+            except Exception as exc:
+                self._log(f"[Outlook] Graph 获取当前邮件 ID 失败，回退 IMAP: {exc}")
+
         imap_conn = None
         try:
             imap_conn = self._open_imap(account)
@@ -3463,6 +3588,27 @@ class OutlookMailbox(BaseMailbox):
         keyword_lower = str(keyword or "").strip().lower()
 
         def poll_once() -> Optional[str]:
+            extra = account.extra or {}
+            if str(extra.get("client_id") or "").strip() and str(extra.get("refresh_token") or "").strip():
+                try:
+                    messages = self._graph_list_messages(account)
+                    for item in messages:
+                        message_id = str(item.get("id") or "").strip()
+                        if not message_id or message_id in seen:
+                            continue
+                        seen.add(message_id)
+                        text = self._extract_graph_message_text(item)
+                        if keyword_lower and keyword_lower not in text.lower():
+                            continue
+                        code = self._safe_extract(text, code_pattern)
+                        if code and code in exclude_codes:
+                            continue
+                        if code:
+                            self._log(f"[Outlook] Graph 收到验证码: {code}")
+                            return code
+                except Exception as exc:
+                    self._log(f"[Outlook] Graph 取件失败，回退 IMAP: {exc}")
+
             imap_conn = None
             try:
                 imap_conn = self._open_imap(account)
@@ -3473,7 +3619,7 @@ class OutlookMailbox(BaseMailbox):
                 ids = data[0].split() if data and data[0] else []
                 if len(ids) > 50:
                     ids = ids[-50:]
-                for uid in ids:
+                for uid in reversed(ids):
                     uid_str = (
                         uid.decode("utf-8", errors="ignore")
                         if isinstance(uid, bytes)

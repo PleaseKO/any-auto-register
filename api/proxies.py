@@ -18,6 +18,10 @@ class ProxyBulkCreate(BaseModel):
     region: str = ""
 
 
+class ProxyBatchDeleteRequest(BaseModel):
+    ids: list[int]
+
+
 @router.get("")
 def list_proxies(session: Session = Depends(get_session)):
     items = session.exec(select(ProxyModel)).all()
@@ -59,6 +63,19 @@ def delete_proxy(proxy_id: int, session: Session = Depends(get_session)):
     session.delete(p)
     session.commit()
     return {"ok": True}
+
+
+@router.post("/batch-delete")
+def batch_delete_proxies(body: ProxyBatchDeleteRequest, session: Session = Depends(get_session)):
+    deleted = 0
+    for proxy_id in body.ids:
+        proxy = session.get(ProxyModel, proxy_id)
+        if not proxy:
+            continue
+        session.delete(proxy)
+        deleted += 1
+    session.commit()
+    return {"ok": True, "deleted": deleted}
 
 
 @router.patch("/{proxy_id}/toggle")

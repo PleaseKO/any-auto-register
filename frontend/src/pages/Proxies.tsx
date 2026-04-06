@@ -17,6 +17,7 @@ export default function Proxies() {
   const [region, setRegion] = useState('')
   const [checking, setChecking] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const load = async () => {
     setLoading(true)
@@ -59,6 +60,17 @@ export default function Proxies() {
   const del = async (id: number) => {
     await apiFetch(`/proxies/${id}`, { method: 'DELETE' })
     message.success('删除成功')
+    load()
+  }
+
+  const batchDelete = async () => {
+    if (!selectedRowKeys.length) return
+    await apiFetch('/proxies/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids: selectedRowKeys }),
+    })
+    message.success(`已删除 ${selectedRowKeys.length} 个代理`)
+    setSelectedRowKeys([])
     load()
   }
 
@@ -136,9 +148,21 @@ export default function Proxies() {
           <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>代理管理</h1>
           <p style={{ color: '#7a8ba3', marginTop: 4 }}>共 {proxies.length} 个代理</p>
         </div>
-        <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
-          检测全部
-        </Button>
+        <Space>
+          {selectedRowKeys.length ? (
+            <Popconfirm
+              title={`确认删除选中的 ${selectedRowKeys.length} 个代理？`}
+              onConfirm={batchDelete}
+            >
+              <Button danger icon={<DeleteOutlined />}>
+                删除 {selectedRowKeys.length} 个
+              </Button>
+            </Popconfirm>
+          ) : null}
+          <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
+            检测全部
+          </Button>
+        </Space>
       </div>
 
       <Card title="添加代理（每行一个）">
@@ -170,6 +194,10 @@ export default function Proxies() {
           columns={columns}
           dataSource={proxies}
           loading={loading}
+          rowSelection={{
+            selectedRowKeys,
+            onChange: setSelectedRowKeys,
+          }}
           pagination={false}
         />
       </Card>

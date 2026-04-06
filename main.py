@@ -79,7 +79,14 @@ app = FastAPI(title="Account Manager", version="1.0.0", lifespan=lifespan)
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    if path.startswith("/api/auth/") or not path.startswith("/api/"):
+    public_api_paths = {
+        "/api/outlook/upload-register-machine",
+    }
+    if (
+        path.startswith("/api/auth/")
+        or path in public_api_paths
+        or not path.startswith("/api/")
+    ):
         return await call_next(request)
     from core.config_store import config_store as _cs
     if not _cs.get("auth_password_hash", ""):
