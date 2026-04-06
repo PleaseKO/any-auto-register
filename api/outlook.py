@@ -3,7 +3,7 @@ import json
 import io
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select, func
@@ -58,12 +58,42 @@ class OutlookUpdateRequest(BaseModel):
     refresh_token: Optional[str] = None
 
 
+def _dedupe_outlook_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    deduped: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_emails: set[str] = set()
+
+    for row in rows:
+        email = str(row.get("email") or "").strip()
+        line_no = row.get("line_no", "?")
+        if "@" not in email:
+            errors.append(f"行 {line_no}: 无效的邮箱地址: {email}")
+            continue
+        email_key = email.lower()
+        if email_key in seen_emails:
+            errors.append(f"行 {line_no}: 请求内重复邮箱: {email}")
+            continue
+        seen_emails.add(email_key)
+        deduped.append(
+            {
+                "line_no": line_no,
+                "email": email,
+                "password": str(row.get("password") or "").strip(),
+                "client_id": str(row.get("client_id") or "").strip(),
+                "refresh_token": str(row.get("refresh_token") or "").strip(),
+            }
+        )
+
+    return deduped, errors
+
+
 def _parse_outlook_import_rows(data: str) -> tuple[int, list[dict[str, Any]], list[str]]:
     lines = (data or "").splitlines()
     total = len(lines)
-    parsed_rows: list[dict[str, Any]] = []
+    raw_rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    seen_emails: set[str] = set()
 
     for idx, raw_line in enumerate(lines):
         line = str(raw_line or "").strip()
@@ -77,17 +107,7 @@ def _parse_outlook_import_rows(data: str) -> tuple[int, list[dict[str, Any]], li
 
         email = str(parts[0] or "").strip()
         password = str(parts[1] or "").strip()
-        if "@" not in email:
-            errors.append(f"行 {idx + 1}: 无效的邮箱地址: {email}")
-            continue
-
-        email_key = email.lower()
-        if email_key in seen_emails:
-            errors.append(f"行 {idx + 1}: 请求内重复邮箱: {email}")
-            continue
-        seen_emails.add(email_key)
-
-        parsed_rows.append(
+        raw_rows.append(
             {
                 "line_no": idx + 1,
                 "email": email,
@@ -97,39 +117,70 @@ def _parse_outlook_import_rows(data: str) -> tuple[int, list[dict[str, Any]], li
             }
         )
 
+    parsed_rows, dedupe_errors = _dedupe_outlook_rows(raw_rows)
+    errors.extend(dedupe_errors)
     return total, parsed_rows, errors
 
 
-def _save_reimport_event(
-    session: Session,
-    *,
-    email: str,
-    source: str,
-    result: str,
-    detail: dict[str, Any] | None = None,
-) -> None:
-    session.add(
-        FailedEmailReimportEventModel(
-            email=str(email or "").strip(),
-            source=str(source or "").strip(),
-            result=str(result or "").strip(),
-            detail_json=json.dumps(detail or {}, ensure_ascii=False),
+def _parse_register_machine_upload_payload(
+    payload: dict[str, Any] | None,
+) -> tuple[int, list[dict[str, Any]], list[str]]:
+    data = payload if isinstance(payload, dict) else {}
+    raw_rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    total = 0
+
+    line_payload = data.get("data")
+    if isinstance(line_payload, str) and line_payload.strip():
+        parsed_total, parsed_rows, parsed_errors = _parse_outlook_import_rows(line_payload)
+        total += parsed_total
+        raw_rows.extend(parsed_rows)
+        errors.extend(parsed_errors)
+
+    def _pick(*keys: str) -> str:
+        for key in keys:
+            if key not in data:
+                continue
+            value = data.get(key)
+            if value is None:
+                continue
+            return str(value).strip()
+        return ""
+
+    account = _pick("a", "account", "email")
+    password = _pick("p", "password")
+    client_id = _pick("c", "client_id", "clientId", "id")
+    refresh_token = _pick("t", "refresh_token", "refreshToken", "token")
+
+    if account or password or client_id or refresh_token:
+        total += 1
+        raw_rows.append(
+            {
+                "line_no": "payload",
+                "email": account,
+                "password": password,
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+            }
         )
-    )
+
+    deduped_rows, dedupe_errors = _dedupe_outlook_rows(raw_rows)
+    errors.extend(dedupe_errors)
+    return total, deduped_rows, errors
 
 
-@router.post("/batch-import", response_model=OutlookBatchImportResponse)
-def batch_import_outlook(request: OutlookBatchImportRequest):
-    """
-    批量导入 Outlook 邮箱账户
-
-    支持两种格式（每行一个账户，字段用 ---- 分隔）：
-    - 邮箱----密码
-    - 邮箱----密码----client_id----refresh_token
-    """
-    total, parsed_rows, errors = _parse_outlook_import_rows(request.data or "")
+def _insert_outlook_rows(
+    *,
+    parsed_rows: list[dict[str, Any]],
+    initial_errors: list[str],
+    enabled: bool,
+    source: str,
+    source_tag: str,
+    total: int,
+) -> OutlookBatchImportResponse:
     success = 0
     accounts: List[Dict[str, Any]] = []
+    errors = list(initial_errors)
     failed = len(errors)
 
     if not parsed_rows:
@@ -147,10 +198,6 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
             select(OutlookAccountModel).where(OutlookAccountModel.email.in_(email_list))
         ).all()
         existing_emails = {str(item.email or "").strip().lower() for item in existing_items}
-        source = str(request.source or "").strip()
-        source_tag = str(request.source_tag or "").strip() or (
-            "failed_reimport" if source in {"failed_email_pool", "failed_email_retry_page"} else "manual"
-        )
 
         rows_to_insert: list[dict[str, Any]] = []
         for row in parsed_rows:
@@ -175,7 +222,7 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
                 password=row["password"],
                 client_id=row["client_id"],
                 refresh_token=row["refresh_token"],
-                enabled=bool(request.enabled),
+                enabled=bool(enabled),
                 source_tag=source_tag,
                 created_at=now,
                 updated_at=now,
@@ -216,7 +263,7 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
                             password=row["password"],
                             client_id=row["client_id"],
                             refresh_token=row["refresh_token"],
-                            enabled=bool(request.enabled),
+                            enabled=bool(enabled),
                             source_tag=source_tag,
                             created_at=_utcnow(),
                             updated_at=_utcnow(),
@@ -260,6 +307,72 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
         failed=failed,
         accounts=accounts,
         errors=errors,
+    )
+
+
+def _save_reimport_event(
+    session: Session,
+    *,
+    email: str,
+    source: str,
+    result: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    session.add(
+        FailedEmailReimportEventModel(
+            email=str(email or "").strip(),
+            source=str(source or "").strip(),
+            result=str(result or "").strip(),
+            detail_json=json.dumps(detail or {}, ensure_ascii=False),
+        )
+    )
+
+
+@router.post("/batch-import", response_model=OutlookBatchImportResponse)
+def batch_import_outlook(request: OutlookBatchImportRequest):
+    """
+    批量导入 Outlook 邮箱账户
+
+    支持两种格式（每行一个账户，字段用 ---- 分隔）：
+    - 邮箱----密码
+    - 邮箱----密码----client_id----refresh_token
+    """
+    total, parsed_rows, errors = _parse_outlook_import_rows(request.data or "")
+    source = str(request.source or "").strip()
+    source_tag = str(request.source_tag or "").strip() or (
+        "failed_reimport" if source in {"failed_email_pool", "failed_email_retry_page"} else "manual"
+    )
+    return _insert_outlook_rows(
+        parsed_rows=parsed_rows,
+        initial_errors=errors,
+        enabled=bool(request.enabled),
+        source=source,
+        source_tag=source_tag,
+        total=total,
+    )
+
+
+@router.post("/upload-register-machine", response_model=OutlookBatchImportResponse)
+def upload_register_machine_outlook(
+    payload: dict[str, Any] = Body(default={}),
+):
+    """
+    兼容邮箱注册机上传面板的 Outlook/Hotmail 账号导入接口。
+
+    支持两种 JSON 模板：
+    1. {"data": "email----password----client_id----refresh_token"}
+    2. {"a":"email","p":"password","c":"client_id","t":"refresh_token"}
+
+    其中 password/client_id/refresh_token 可按需要省略。
+    """
+    total, parsed_rows, errors = _parse_register_machine_upload_payload(payload)
+    return _insert_outlook_rows(
+        parsed_rows=parsed_rows,
+        initial_errors=errors,
+        enabled=True,
+        source="register_machine_upload",
+        source_tag="register_machine",
+        total=total,
     )
 
 

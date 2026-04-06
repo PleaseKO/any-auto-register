@@ -21,6 +21,17 @@ type OutlookListResponse = {
   items: OutlookAccount[]
 }
 
+function renderSourceTag(sourceTag: string) {
+  const normalized = String(sourceTag || '').trim().toLowerCase()
+  if (normalized === 'failed_reimport') {
+    return <Tag color="volcano">失败回流</Tag>
+  }
+  if (normalized === 'register_machine') {
+    return <Tag color="geekblue">注册机上传</Tag>
+  }
+  return <Tag>普通导入</Tag>
+}
+
 export default function OutlookListPage() {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
@@ -117,7 +128,7 @@ export default function OutlookListPage() {
       title: '标签',
       dataIndex: 'source_tag',
       width: 100,
-      render: (v: string) => (String(v || '') === 'failed_reimport' ? <Tag color="volcano">失败回流</Tag> : <Tag>普通导入</Tag>),
+      render: (v: string) => renderSourceTag(v),
     },
     {
       title: '操作',
@@ -148,12 +159,13 @@ export default function OutlookListPage() {
           <Space wrap>
             <Tag color="blue">已导入: {data?.total || 0} 个</Tag>
             <Tag color="volcano">失败回流: {(data?.items || []).filter(item => item.source_tag === 'failed_reimport').length} 个</Tag>
-            <Typography.Text type="secondary">支持本地 TXT 批量导入与失败邮箱回流</Typography.Text>
+            <Tag color="geekblue">注册机上传: {(data?.items || []).filter(item => item.source_tag === 'register_machine').length} 个</Tag>
+            <Typography.Text type="secondary">支持本地 TXT 批量导入、失败邮箱回流与注册机上传</Typography.Text>
           </Space>
           <Space wrap>
             <Input value={q} onChange={e => setQ(e.target.value)} placeholder="搜索邮箱" style={{ width: 240 }} />
             <Input value={enabled} onChange={e => setEnabled(e.target.value)} placeholder="enabled: true/false（可选）" style={{ width: 220 }} />
-            <Input value={sourceTag} onChange={e => setSourceTag(e.target.value)} placeholder="source_tag: failed_reimport（可选）" style={{ width: 260 }} />
+            <Input value={sourceTag} onChange={e => setSourceTag(e.target.value)} placeholder="source_tag: failed_reimport / register_machine（可选）" style={{ width: 320 }} />
             <Button onClick={() => void load()} loading={loading}>应用</Button>
           </Space>
         </Space>
