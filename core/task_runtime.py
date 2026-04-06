@@ -149,13 +149,20 @@ class RegisterTaskRecord:
     )
 
     def to_dict(self) -> dict[str, Any]:
+        failed = len(self.errors)
+        completed = self.success + self.skipped + failed
+        percent = int((completed / self.total) * 100) if self.total > 0 else 0
         data = {
             "id": self.id,
             "status": self.status,
             "platform": self.platform,
             "source": self.source,
             "meta": dict(self.meta),
+            "total": self.total,
             "progress": self.progress,
+            "completed": completed,
+            "failed": failed,
+            "progress_percent": max(0, min(percent, 100)),
             "logs": list(self.logs),
             "success": self.success,
             "skipped": self.skipped,
@@ -263,6 +270,21 @@ class RegisterTaskStore:
         with self._lock:
             record = self._records[task_id]
             record.cashier_urls.append(cashier_url)
+            record.updated_at = time.time()
+
+    def update_result_counts(
+        self,
+        task_id: str,
+        *,
+        success: int,
+        skipped: int,
+        errors: list[str],
+    ) -> None:
+        with self._lock:
+            record = self._records[task_id]
+            record.success = success
+            record.skipped = skipped
+            record.errors = list(errors)
             record.updated_at = time.time()
 
     def finish(

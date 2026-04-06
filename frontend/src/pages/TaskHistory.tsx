@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Card, Table, Select, Button, Tag, Space, Popconfirm, Typography, message } from 'antd'
-import type { TableColumnsType } from 'antd'
-import { ReloadOutlined, DeleteOutlined } from '@ant-design/icons'
+import { Button, Card, Popconfirm, Select, Space, Table, Tag, Typography, message } from 'antd'
+import type { TablePaginationConfig, TableColumnsType } from 'antd'
+import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
+import { PageHeader } from '@/components/PageHeader'
 import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
@@ -11,7 +12,7 @@ interface TaskLogItem {
   created_at: string
   platform: string
   email: string
-  status: 'success' | 'failed'
+  status: 'success' | 'failed' | 'skipped'
   error: string
 }
 
@@ -26,39 +27,65 @@ interface TaskLogBatchDeleteResponse {
   total_requested: number
 }
 
+const PLATFORM_OPTIONS = [
+  { value: '', label: '全部平台' },
+  { value: 'chatgpt', label: 'ChatGPT' },
+  { value: 'grok', label: 'Grok' },
+  { value: 'kiro', label: 'Kiro' },
+  { value: 'openblocklabs', label: 'OpenBlockLabs' },
+  { value: 'tavily', label: 'Tavily' },
+  { value: 'trae', label: 'Trae' },
+  { value: 'cursor', label: 'Cursor' },
+]
+
+function formatTime(value: string) {
+  if (!value) return '-'
+  return new Date(value).toLocaleString('zh-CN')
+}
+
 export default function TaskHistory() {
   const [logs, setLogs] = useState<TaskLogItem[]>([])
   const [total, setTotal] = useState(0)
   const [platform, setPlatform] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([])
+  const [pagination, setPagination] = useState<TablePaginationConfig>({
+    current: 1,
+    pageSize: 20,
+    showSizeChanger: true,
+    pageSizeOptions: [20, 50, 100, 200],
+  })
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (next?: Partial<TablePaginationConfig>) => {
+    const current = next?.current ?? pagination.current ?? 1
+    const pageSize = next?.pageSize ?? pagination.pageSize ?? 20
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: '1', page_size: '50' })
+      const params = new URLSearchParams({
+        page: String(current),
+        page_size: String(pageSize),
+      })
       if (platform) params.set('platform', platform)
-      const data = await apiFetch(`/tasks/logs?${params}`) as TaskLogListResponse
+      const data = await apiFetch(`/tasks/logs?${params.toString()}`) as TaskLogListResponse
       setLogs(data.items || [])
-      setTotal(data.total || 0)
-      setSelectedRowKeys((prev) => prev.filter((key) => data.items.some((item) => item.id === key)))
+      setTotal(Number(data.total || 0))
+      setPagination(prev => ({ ...prev, current, pageSize, total: Number(data.total || 0) }))
+      setSelectedRowKeys(prev => prev.filter(key => (data.items || []).some(item => item.id === key)))
     } finally {
       setLoading(false)
     }
-  }, [platform])
+  }, [pagination.current, pagination.pageSize, platform])
 
   useEffect(() => {
-    load()
+    void load({ current: 1 })
   }, [load])
 
   const handleBatchDelete = async () => {
-    if (selectedRowKeys.length === 0) return
-
+    if (!selectedRowKeys.length) return
     const result = await apiFetch('/tasks/logs/batch-delete', {
       method: 'POST',
       body: JSON.stringify({ ids: selectedRowKeys }),
     }) as TaskLogBatchDeleteResponse
-
     message.success(`已删除 ${result.deleted} 条任务历史`)
     if (result.not_found.length > 0) {
       message.warning(`${result.not_found.length} 条记录不存在或已被删除`)
@@ -73,29 +100,31 @@ export default function TaskHistory() {
       dataIndex: 'created_at',
       key: 'created_at',
       width: 180,
-      render: (text: string) => (text ? new Date(text).toLocaleString('zh-CN') : '-'),
+      render: (text: string) => <Text type="secondary">{formatTime(text)}</Text>,
     },
     {
       title: '平台',
       dataIndex: 'platform',
       key: 'platform',
-      width: 100,
-      render: (text: string) => <Tag>{text}</Tag>,
+      width: 110,
+      render: (text: string) => <Tag>{text || '-'}</Tag>,
     },
     {
       title: '邮箱',
       dataIndex: 'email',
       key: 'email',
-      render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text}</span>,
+      render: (text: string) => (
+        <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text || '-'}</span>
+      ),
     },
     {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 80,
+      width: 90,
       render: (status: string) => (
-        <Tag color={status === 'success' ? 'success' : 'error'}>
-          {status === 'success' ? '成功' : '失败'}
+        <Tag color={status === 'success' ? 'success' : status === 'failed' ? 'error' : 'gold'}>
+          {status === 'success' ? '成功' : status === 'failed' ? '失败' : '跳过'}
         </Tag>
       ),
     },
@@ -103,48 +132,48 @@ export default function TaskHistory() {
       title: '错误信息',
       dataIndex: 'error',
       key: 'error',
+      ellipsis: true,
       render: (text: string) => text || '-',
     },
   ]
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>任务历史</h1>
-          <p style={{ color: '#7a8ba3', marginTop: 4 }}>注册任务执行记录</p>
-        </div>
-        <Space>
-          <Text type="secondary">{total} 条记录</Text>
-          {selectedRowKeys.length > 0 && <Text type="success">已选 {selectedRowKeys.length} 条</Text>}
-          {selectedRowKeys.length > 0 && (
-            <Popconfirm
-              title={`确认删除选中的 ${selectedRowKeys.length} 条任务历史？`}
-              onConfirm={handleBatchDelete}
-            >
-              <Button danger icon={<DeleteOutlined />}>
-                删除 {selectedRowKeys.length} 条
-              </Button>
-            </Popconfirm>
-          )}
-          <Select
-            value={platform}
-            onChange={(value) => {
-              setPlatform(value)
-              setSelectedRowKeys([])
-            }}
-            style={{ width: 120 }}
-            options={[
-              { value: '', label: '全部平台' },
-              { value: 'trae', label: 'Trae' },
-              { value: 'cursor', label: 'Cursor' },
-            ]}
-          />
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} loading={loading} />
-        </Space>
-      </div>
+      <PageHeader
+        eyebrow="任务历史"
+        title="统一查看任务日志，并按页治理历史数据"
+        description="服务端分页加载，避免一次性拉全量日志；适合清理和追踪执行结果。"
+        extra={
+          <Space wrap>
+            <Text type="secondary">{total} 条记录</Text>
+            {selectedRowKeys.length > 0 ? <Text type="success">已选 {selectedRowKeys.length} 条</Text> : null}
+            <Select
+              value={platform}
+              onChange={(value) => {
+                setPlatform(value)
+                setSelectedRowKeys([])
+              }}
+              style={{ width: 170 }}
+              options={PLATFORM_OPTIONS}
+            />
+            {selectedRowKeys.length > 0 ? (
+              <Popconfirm
+                title={`确认删除选中的 ${selectedRowKeys.length} 条任务历史？`}
+                onConfirm={() => void handleBatchDelete()}
+              >
+                <Button danger icon={<DeleteOutlined />}>
+                  删除 {selectedRowKeys.length} 条
+                </Button>
+              </Popconfirm>
+            ) : null}
+            <Button icon={<ReloadOutlined spin={loading} />} onClick={() => void load()} loading={loading}>
+              刷新
+            </Button>
+          </Space>
+        }
+      />
 
-      <Card>
+      <Card bordered={false}>
         <Table
           rowKey="id"
           columns={columns}
@@ -152,9 +181,12 @@ export default function TaskHistory() {
           loading={loading}
           rowSelection={{
             selectedRowKeys,
-            onChange: (keys) => setSelectedRowKeys(keys as number[]),
+            onChange: keys => setSelectedRowKeys(keys as number[]),
           }}
-          pagination={{ pageSize: 20, showSizeChanger: false }}
+          pagination={pagination}
+          onChange={(pager) => {
+            void load({ current: pager.current, pageSize: pager.pageSize })
+          }}
         />
       </Card>
     </div>

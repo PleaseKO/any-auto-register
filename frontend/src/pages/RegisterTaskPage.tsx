@@ -4,6 +4,7 @@ import {
   Form,
   Input,
   InputNumber,
+  Progress,
   Select,
   Button,
   Checkbox,
@@ -11,12 +12,15 @@ import {
   Space,
   Typography,
   Descriptions,
+  Divider,
 } from 'antd'
 import {
   PlayCircleOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
+  EyeOutlined,
+  EyeInvisibleOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
@@ -25,13 +29,16 @@ import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
+import { useSearchParams } from 'react-router-dom'
 
 const { Text } = Typography
 
 export default function RegisterTaskPage() {
   const [form] = Form.useForm()
+  const [searchParams] = useSearchParams()
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
+  const [logVisible, setLogVisible] = useState(true)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
 
@@ -101,6 +108,25 @@ export default function RegisterTaskPage() {
     })
   }, [form])
 
+  useEffect(() => {
+    const useFailedReimportOnly = ['1', 'true', 'yes'].includes(
+      String(searchParams.get('outlook_failed_reimport_only') || '').trim().toLowerCase()
+    )
+    const forceOutlookProvider = ['1', 'true', 'yes'].includes(
+      String(searchParams.get('use_outlook_pool') || '').trim().toLowerCase()
+    )
+    if (!useFailedReimportOnly && !forceOutlookProvider) return
+
+    const nextValues: Record<string, any> = {}
+    if (forceOutlookProvider || useFailedReimportOnly) {
+      nextValues.mail_provider = 'outlook'
+    }
+    if (useFailedReimportOnly) {
+      nextValues.outlook_only_failed_reimport = true
+    }
+    form.setFieldsValue(nextValues)
+  }, [form, searchParams])
+
   const submit = async () => {
     const values = await form.validateFields()
     const registerExtra = {
@@ -159,6 +185,7 @@ export default function RegisterTaskPage() {
       luckmail_api_key: values.luckmail_api_key,
       luckmail_email_type: values.luckmail_email_type,
       luckmail_domain: values.luckmail_domain,
+      outlook_source_tag_filter: values.outlook_only_failed_reimport ? 'failed_reimport' : '',
       yescaptcha_key: values.yescaptcha_key,
       solver_url: values.solver_url,
     }
@@ -187,6 +214,7 @@ export default function RegisterTaskPage() {
       }),
     })
     setTask(res)
+    setLogVisible(true)
     setPolling(true)
     pollTask(res.task_id)
   }
@@ -209,6 +237,14 @@ export default function RegisterTaskPage() {
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
   const executorOptions = getExecutorOptions(platform)
+  const failedCount = Number(task?.failed ?? task?.errors?.length ?? 0)
+  const successCount = Number(task?.success ?? 0)
+  const skippedCount = Number(task?.skipped ?? 0)
+  const totalCount = Number(task?.total ?? 0)
+  const completedCount = Number(task?.completed ?? successCount + skippedCount + failedCount)
+  const progressPercent = Number(
+    task?.progress_percent ?? (totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0)
+  )
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -273,7 +309,7 @@ export default function RegisterTaskPage() {
               <Input type="number" min={1} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
-              <Input type="number" min={1} max={5} />
+              <Input type="number" min={1} max={20} />
             </Form.Item>
           </Space>
           <Space style={{ width: '100%' }}>
@@ -311,6 +347,7 @@ export default function RegisterTaskPage() {
                 { value: 'freemail', label: 'Freemail' },
                 { value: 'laoudo', label: 'Laoudo' },
                 { value: 'cfworker', label: 'CF Worker' },
+                { value: 'outlook', label: 'Outlook（本地导入）' },
               ]}
             />
           </Form.Item>
@@ -405,6 +442,18 @@ export default function RegisterTaskPage() {
               </Form.Item>
               <Form.Item name="applemail_mailboxes" label="轮询文件夹">
                 <Input placeholder="INBOX,Junk" />
+              </Form.Item>
+            </>
+          )}
+          {mailProvider === 'outlook' && (
+            <>
+              <Form.Item
+                name="outlook_only_failed_reimport"
+                label="执行范围"
+                valuePropName="checked"
+                extra="勾选后，本次任务只会从带“失败回流”标签的 Outlook 邮箱里取号。"
+              >
+                <Checkbox>只执行失败回流邮箱</Checkbox>
               </Form.Item>
             </>
           )}
@@ -589,6 +638,25 @@ export default function RegisterTaskPage() {
             <Descriptions.Item label="进度">{task.progress}</Descriptions.Item>
             <Descriptions.Item label="跳过">{task.skipped ?? 0}</Descriptions.Item>
           </Descriptions>
+          <div style={{ marginTop: 12 }}>
+            <Progress
+              percent={progressPercent}
+              status={task.status === 'failed' ? 'exception' : task.status === 'done' ? 'success' : 'active'}
+              strokeColor={{
+                '0%': '#10b981',
+                '70%': '#f59e0b',
+                '100%': '#ef4444',
+              }}
+              format={() => `${completedCount}/${totalCount || 0}`}
+            />
+            <Space size={8} wrap style={{ marginTop: 8 }}>
+              <Tag color="green">成功 {successCount}</Tag>
+              <Tag color="red">失败 {failedCount}</Tag>
+              <Tag color="gold">跳过 {skippedCount}</Tag>
+              <Tag color="blue">总数 {totalCount || 0}</Tag>
+              {polling ? <Tag color="processing">执行中</Tag> : null}
+            </Space>
+          </div>
           {task.success != null && (
             <div style={{ marginTop: 8, color: '#10b981' }}>
               <CheckCircleOutlined /> 成功 {task.success} 个
@@ -610,7 +678,18 @@ export default function RegisterTaskPage() {
           )}
           {task.id ? (
             <div style={{ marginTop: 16 }}>
-              <TaskLogPanel taskId={task.id} />
+              <Divider style={{ margin: '12px 0' }} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <Text strong>任务日志</Text>
+                <Button
+                  size="small"
+                  icon={logVisible ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+                  onClick={() => setLogVisible(v => !v)}
+                >
+                  {logVisible ? '关闭日志' : '重新打开日志'}
+                </Button>
+              </div>
+              {logVisible ? <TaskLogPanel taskId={task.id} /> : <Text type="secondary">日志已关闭，可点击“重新打开日志”继续查看实时输出。</Text>}
             </div>
           ) : null}
         </Card>

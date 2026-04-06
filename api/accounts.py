@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
-from core.db import AccountModel, get_session
+from core.db import AccountModel, OutlookAccountModel, TaskLog, get_session
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
@@ -58,7 +58,14 @@ def list_accounts(
         q = q.where(AccountModel.created_at >= created_at_start)
     if created_at_end:
         q = q.where(AccountModel.created_at <= created_at_end)
-    total = len(session.exec(q).all())
+    count_q = select(func.count()).select_from(AccountModel)
+    if platform:
+        count_q = count_q.where(AccountModel.platform == platform)
+    if status:
+        count_q = count_q.where(AccountModel.status == status)
+    if email:
+        count_q = count_q.where(AccountModel.email.contains(email))
+    total = int(session.exec(count_q).one() or 0)
     items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
     return {"total": total, "page": page, "items": items}
 
@@ -82,13 +89,72 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
 @router.get("/stats")
 def get_stats(session: Session = Depends(get_session)):
     """统计各平台账号数量和状态分布"""
-    accounts = session.exec(select(AccountModel)).all()
-    platforms: dict = {}
-    statuses: dict = {}
-    for acc in accounts:
-        platforms[acc.platform] = platforms.get(acc.platform, 0) + 1
-        statuses[acc.status] = statuses.get(acc.status, 0) + 1
-    return {"total": len(accounts), "by_platform": platforms, "by_status": statuses}
+    total = int(session.exec(select(func.count()).select_from(AccountModel)).one() or 0)
+    platform_rows = session.exec(
+        select(AccountModel.platform, func.count()).group_by(AccountModel.platform)
+    ).all()
+    status_rows = session.exec(
+        select(AccountModel.status, func.count()).group_by(AccountModel.status)
+    ).all()
+    task_status_rows = session.exec(
+        select(TaskLog.status, func.count()).group_by(TaskLog.status)
+    ).all()
+    failed_logs = session.exec(select(TaskLog).where(TaskLog.status == "failed")).all()
+    outlook_total = int(
+        session.exec(select(func.count()).select_from(OutlookAccountModel)).one() or 0
+    )
+    outlook_enabled = int(
+        session.exec(
+            select(func.count())
+            .select_from(OutlookAccountModel)
+            .where(OutlookAccountModel.enabled == True)  # noqa: E712
+        ).one()
+        or 0
+    )
+    outlook_oauth = int(
+        session.exec(
+            select(func.count())
+            .select_from(OutlookAccountModel)
+            .where(OutlookAccountModel.client_id != "")
+            .where(OutlookAccountModel.refresh_token != "")
+        ).one()
+        or 0
+    )
+
+    importable_failed = 0
+    inferred_failed = 0
+    for log in failed_logs:
+        try:
+            detail = json.loads(log.detail_json or "{}")
+        except Exception:
+            detail = {}
+        extra = detail.get("extra") or {}
+        email_value = str(detail.get("email") or log.email or "").strip()
+        password_value = str(detail.get("password") or "").strip()
+        if email_value and password_value:
+            importable_failed += 1
+        if extra.get("backfill_mode"):
+            inferred_failed += 1
+
+    return {
+        "total": total,
+        "by_platform": {str(name): int(count or 0) for name, count in platform_rows},
+        "by_status": {str(name): int(count or 0) for name, count in status_rows},
+        "task_logs": {
+            "total": sum(int(count or 0) for _, count in task_status_rows),
+            "by_status": {str(name): int(count or 0) for name, count in task_status_rows},
+            "failed_email_pool": {
+                "total": len(failed_logs),
+                "importable": importable_failed,
+                "inferred": inferred_failed,
+            },
+        },
+        "outlook_pool": {
+            "total": outlook_total,
+            "enabled": outlook_enabled,
+            "oauth": outlook_oauth,
+        },
+    }
 
 
 @router.get("/export")

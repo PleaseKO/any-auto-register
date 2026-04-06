@@ -333,6 +333,7 @@ def create_mailbox(
             imap_server=extra.get("outlook_imap_server", ""),
             imap_port=extra.get("outlook_imap_port", ""),
             token_endpoint=extra.get("outlook_token_endpoint", ""),
+            source_tag_filter=extra.get("outlook_source_tag_filter", ""),
             proxy=proxy,
         )
     else:  # laoudo
@@ -2789,6 +2790,31 @@ class LuckMailMailbox(BaseMailbox):
         self._token = None
         self._email = None
 
+    def _select_existing_purchase(self) -> Optional[dict]:
+        try:
+            purchases = self._client.user.get_purchases(
+                page=1,
+                page_size=100,
+                user_disabled=0,
+            )
+        except Exception:
+            return None
+
+        for item in purchases.list:
+            email = str(getattr(item, "email_address", "") or "").strip()
+            token = str(getattr(item, "token", "") or "").strip()
+            if not email or not token:
+                continue
+            if int(getattr(item, "user_disabled", 0) or 0) != 0:
+                continue
+            return {
+                "email_address": email,
+                "token": token,
+                "warranty_until": getattr(item, "warranty_until", None),
+                "project_name": getattr(item, "project_name", ""),
+            }
+        return None
+
     def _use_purchase_mode(self, account: MailboxAccount = None) -> bool:
         if (
             account
@@ -2877,6 +2903,7 @@ class LuckMailMailbox(BaseMailbox):
                 f"[LuckMail] 分支: ChatGPT + LuckMail -> 购买邮箱接口 "
                 f"(project_code={self._project_code}, email_type={self._email_type or '-'}, domain={self._domain or '-'})"
             )
+            result = None
             try:
                 result = self._client.user.purchase_emails(
                     project_code=self._project_code,
@@ -2885,11 +2912,23 @@ class LuckMailMailbox(BaseMailbox):
                     domain=self._domain,
                 )
             except Exception as e:
-                raise RuntimeError(f"LuckMail 购买邮箱失败: {e}") from e
+                self._log(f"[LuckMail] 购买邮箱失败，尝试回退已购邮箱池: {e}")
 
             purchases = (result or {}).get("purchases") or []
+            fallback_reason = ""
             if not purchases:
-                raise RuntimeError(f"LuckMail 购买邮箱返回为空: {result}")
+                fallback_reason = (
+                    f"LuckMail 购买邮箱失败或返回为空，尝试回退已购邮箱池: {result}"
+                )
+                self._log(f"[LuckMail] {fallback_reason}")
+                existing = self._select_existing_purchase()
+                if existing:
+                    purchases = [existing]
+                    self._log(
+                        "[LuckMail] 已从账号现有已购邮箱池回退获取可用邮箱"
+                    )
+                else:
+                    raise RuntimeError(fallback_reason)
 
             item = purchases[0]
             email = str(item.get("email_address") or "").strip()
@@ -3073,6 +3112,7 @@ class OutlookMailbox(BaseMailbox):
         imap_server: str = "",
         imap_port: int | str = 993,
         token_endpoint: str = "",
+        source_tag_filter: str = "",
         proxy: str = None,
     ):
         self._lock = threading.Lock()
@@ -3104,6 +3144,7 @@ class OutlookMailbox(BaseMailbox):
         except (TypeError, ValueError):
             self._imap_port = 993
         self._token_endpoint = str(token_endpoint or "").strip()
+        self._source_tag_filter = str(source_tag_filter or "").strip().lower()
 
     def _pop_account(self) -> dict:
         from sqlmodel import Session, select
@@ -3113,13 +3154,27 @@ class OutlookMailbox(BaseMailbox):
             with Session(engine) as session:
                 account = (
                     session.exec(
-                        select(OutlookAccountModel)
-                        .where(OutlookAccountModel.enabled == True)
-                        .order_by(OutlookAccountModel.id)
-                    )
-                    .first()
+                        (
+                            select(OutlookAccountModel)
+                            .where(OutlookAccountModel.enabled == True)
+                            .where(
+                                OutlookAccountModel.source_tag == self._source_tag_filter
+                            )
+                            .order_by(OutlookAccountModel.id.desc())
+                        )
+                        if self._source_tag_filter
+                        else (
+                            select(OutlookAccountModel)
+                            .where(OutlookAccountModel.enabled == True)
+                            .order_by(OutlookAccountModel.id)
+                        )
+                    ).first()
                 )
                 if not account:
+                    if self._source_tag_filter:
+                        raise RuntimeError(
+                            f"未找到标签为 {self._source_tag_filter} 的 Outlook 账号，请先导入对应邮箱"
+                        )
                     raise RuntimeError("Outlook 账号池为空，请先在设置页批量导入")
 
                 payload = {
@@ -3128,6 +3183,7 @@ class OutlookMailbox(BaseMailbox):
                     "password": account.password,
                     "client_id": account.client_id,
                     "refresh_token": account.refresh_token,
+                    "source_tag": account.source_tag,
                 }
                 session.delete(account)
                 session.commit()

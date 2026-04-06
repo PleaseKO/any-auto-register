@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import os
 from typing import Optional
 from sqlmodel import Field, SQLModel, create_engine, Session, select
+from sqlalchemy import text
 import json
 
 
@@ -41,12 +42,23 @@ class TaskLog(SQLModel, table=True):
     __tablename__ = "task_logs"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str
-    email: str
-    status: str        # success | failed
+    platform: str = Field(index=True)
+    email: str = Field(index=True)
+    status: str = Field(index=True)       # success | failed
     error: str = ""
     detail_json: str = "{}"
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class FailedEmailReimportEventModel(SQLModel, table=True):
+    __tablename__ = "failed_email_reimport_events"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+    source: str = Field(default="", index=True)
+    result: str = Field(default="", index=True)  # imported | duplicate | failed | skipped
+    detail_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
 class OutlookAccountModel(SQLModel, table=True):
@@ -57,10 +69,11 @@ class OutlookAccountModel(SQLModel, table=True):
     password: str
     client_id: str = ""
     refresh_token: str = ""
-    enabled: bool = True
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
-    last_used: Optional[datetime] = None
+    enabled: bool = Field(default=True, index=True)
+    source_tag: str = Field(default="manual", index=True)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+    last_used: Optional[datetime] = Field(default=None, index=True)
 
 
 class ProxyModel(SQLModel, table=True):
@@ -115,6 +128,31 @@ def save_account(account) -> 'AccountModel':
 
 def init_db():
     SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        columns = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(outlook_accounts)")).fetchall()
+        }
+        if "source_tag" not in columns:
+            conn.execute(
+                text("ALTER TABLE outlook_accounts ADD COLUMN source_tag TEXT DEFAULT 'manual'")
+            )
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_task_logs_status_platform_created_at "
+            "ON task_logs (status, platform, created_at)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_outlook_accounts_enabled_id "
+            "ON outlook_accounts (enabled, id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_outlook_accounts_enabled_source_tag_id "
+            "ON outlook_accounts (enabled, source_tag, id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_failed_email_reimport_email_created_at "
+            "ON failed_email_reimport_events (email, created_at)"
+        ))
 
 
 def get_session():

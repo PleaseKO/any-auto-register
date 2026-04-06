@@ -17,6 +17,9 @@ import {
   Alert,
   DatePicker,
   theme,
+  Progress,
+  Descriptions,
+  Divider,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
@@ -29,6 +32,8 @@ import {
   MoreOutlined,
   DeleteOutlined,
   SyncOutlined,
+  EyeOutlined,
+  EyeInvisibleOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
@@ -39,6 +44,7 @@ import { apiFetch } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
+const REGISTER_TASK_STORAGE_KEY = 'accounts_register_task_snapshot'
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
@@ -546,8 +552,26 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
+  const [registerTask, setRegisterTask] = useState<any>(null)
+  const [registerTaskPolling, setRegisterTaskPolling] = useState(false)
+  const [registerLogVisible, setRegisterLogVisible] = useState(true)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+
+  const persistRegisterTaskSnapshot = useCallback((nextTaskId: string | null, platformName: string) => {
+    if (!nextTaskId) {
+      localStorage.removeItem(REGISTER_TASK_STORAGE_KEY)
+      return
+    }
+    localStorage.setItem(
+      REGISTER_TASK_STORAGE_KEY,
+      JSON.stringify({
+        taskId: nextTaskId,
+        platform: platformName,
+        savedAt: Date.now(),
+      }),
+    )
+  }, [])
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -812,10 +836,83 @@ export default function Accounts() {
         }),
       })
       setTaskId(res.task_id)
+      setRegisterTask(res)
+      setRegisterLogVisible(true)
+      setRegisterTaskPolling(true)
+      persistRegisterTaskSnapshot(res.task_id, currentPlatform)
+      const interval = setInterval(async () => {
+        const t = await apiFetch(`/tasks/${res.task_id}`)
+        setRegisterTask(t)
+        if (t.status === 'done' || t.status === 'failed' || t.status === 'stopped') {
+          clearInterval(interval)
+          setRegisterTaskPolling(false)
+          load()
+        }
+      }, 2000)
     } finally {
       setRegisterLoading(false)
     }
   }
+
+  const closeRegisterModal = () => {
+    setRegisterModalOpen(false)
+  }
+
+  const resetRegisterTaskState = () => {
+    setTaskId(null)
+    setRegisterTask(null)
+    setRegisterTaskPolling(false)
+    setRegisterLogVisible(true)
+    persistRegisterTaskSnapshot(null, currentPlatform)
+    registerForm.resetFields()
+  }
+
+  useEffect(() => {
+    const raw = localStorage.getItem(REGISTER_TASK_STORAGE_KEY)
+    if (!raw) return
+    try {
+      const parsed = JSON.parse(raw || '{}')
+      const savedTaskId = String(parsed.taskId || '').trim()
+      const savedPlatform = String(parsed.platform || '').trim()
+      if (!savedTaskId || savedPlatform !== currentPlatform) return
+
+      let cancelled = false
+      const restore = async () => {
+        try {
+          const t = await apiFetch(`/tasks/${savedTaskId}`)
+          if (cancelled) return
+          setTaskId(savedTaskId)
+          setRegisterTask(t)
+          setRegisterLogVisible(true)
+          const finished = ['done', 'failed', 'stopped'].includes(String(t?.status || ''))
+          setRegisterTaskPolling(!finished)
+          if (finished) return
+
+          const interval = setInterval(async () => {
+            const nextTask = await apiFetch(`/tasks/${savedTaskId}`)
+            if (cancelled) {
+              clearInterval(interval)
+              return
+            }
+            setRegisterTask(nextTask)
+            if (['done', 'failed', 'stopped'].includes(String(nextTask?.status || ''))) {
+              clearInterval(interval)
+              setRegisterTaskPolling(false)
+              load()
+            }
+          }, 2000)
+        } catch {
+          localStorage.removeItem(REGISTER_TASK_STORAGE_KEY)
+        }
+      }
+      void restore()
+      return () => {
+        cancelled = true
+      }
+    } catch {
+      localStorage.removeItem(REGISTER_TASK_STORAGE_KEY)
+    }
+  }, [currentPlatform, load])
 
   const handleDetailSave = async () => {
     const values = await detailForm.validateFields()
@@ -1334,7 +1431,9 @@ export default function Accounts() {
           <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>
+            {taskId ? '查看注册任务' : '注册'}
+          </Button>
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
         </Space>
       </div>
@@ -1362,7 +1461,7 @@ export default function Accounts() {
       <Modal
         title={`注册 ${currentPlatform}`}
         open={registerModalOpen}
-        onCancel={() => { setRegisterModalOpen(false); setTaskId(null); registerForm.resetFields(); }}
+        onCancel={closeRegisterModal}
         footer={null}
         width={500}
         maskClosable={false}
@@ -1373,7 +1472,7 @@ export default function Accounts() {
               <Input type="number" min={1} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={5} />
+              <Input type="number" min={1} max={20} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
@@ -1393,7 +1492,60 @@ export default function Accounts() {
             </Form.Item>
           </Form>
         ) : (
-          <TaskLogPanel taskId={taskId} onDone={() => { load(); }} />
+          <>
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="任务 ID">
+                <Text copyable style={{ fontFamily: 'monospace' }}>{registerTask?.id || taskId}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="进度">{registerTask?.progress || '-'}</Descriptions.Item>
+              <Descriptions.Item label="跳过">{registerTask?.skipped ?? 0}</Descriptions.Item>
+            </Descriptions>
+            <div style={{ marginTop: 12 }}>
+              <Progress
+                percent={Number(registerTask?.progress_percent ?? 0)}
+                status={
+                  registerTask?.status === 'failed'
+                    ? 'exception'
+                    : registerTask?.status === 'done'
+                      ? 'success'
+                      : 'active'
+                }
+                strokeColor={{
+                  '0%': '#10b981',
+                  '70%': '#f59e0b',
+                  '100%': '#ef4444',
+                }}
+                format={() => `${Number(registerTask?.completed ?? 0)}/${Number(registerTask?.total ?? 0)}`}
+              />
+              <Space size={8} wrap style={{ marginTop: 8 }}>
+                <Tag color="green">成功 {Number(registerTask?.success ?? 0)}</Tag>
+                <Tag color="red">失败 {Number(registerTask?.failed ?? registerTask?.errors?.length ?? 0)}</Tag>
+                <Tag color="gold">跳过 {Number(registerTask?.skipped ?? 0)}</Tag>
+                <Tag color="blue">总数 {Number(registerTask?.total ?? 0)}</Tag>
+                {registerTaskPolling ? <Tag color="processing">执行中</Tag> : null}
+              </Space>
+            </div>
+            <Divider style={{ margin: '12px 0' }} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <Text strong>任务日志</Text>
+              <Button
+                size="small"
+                icon={registerLogVisible ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+                onClick={() => setRegisterLogVisible(v => !v)}
+              >
+                {registerLogVisible ? '关闭日志' : '重新打开日志'}
+              </Button>
+            </div>
+            {registerLogVisible ? (
+              <TaskLogPanel taskId={taskId} onDone={() => { load() }} />
+            ) : (
+              <Text type="secondary">日志已关闭，可点击“重新打开日志”继续查看实时输出。</Text>
+            )}
+            <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <Button onClick={closeRegisterModal}>关闭弹窗</Button>
+              <Button danger onClick={resetRegisterTaskState}>清空当前任务视图</Button>
+            </div>
+          </>
         )}
       </Modal>
 

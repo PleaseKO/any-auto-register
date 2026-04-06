@@ -24,6 +24,8 @@ import FailedAccounts from '@/pages/FailedAccounts'
 import Login from '@/pages/Login'
 import EmailPool from '@/pages/EmailPool'
 import FailedEmailPool from '@/pages/FailedEmailPool'
+import FailedEmailRetryPage from '@/pages/FailedEmailRetryPage'
+import ReimportSuccessPage from '@/pages/ReimportSuccessPage'
 import { darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
 
@@ -149,6 +151,8 @@ function AppContent() {
         { key: '/mailpool/outlook', label: 'Outlook 列表' },
         { key: '/mailpool/outlook/import', label: 'Outlook 导入' },
         { key: '/mailpool/failed', label: '失败邮箱' },
+        { key: '/mailpool/failed/retry-over-2', label: '失败重试>2次' },
+        { key: '/mailpool/reimport-success', label: '回流后成功' },
       ],
     },
   ]
@@ -263,6 +267,8 @@ function AppContent() {
             <Route path="/mailpool/outlook" element={<EmailPool />} />
             <Route path="/mailpool/outlook/import" element={<EmailPool />} />
             <Route path="/mailpool/failed" element={<FailedEmailPool />} />
+            <Route path="/mailpool/failed/retry-over-2" element={<FailedEmailRetryPage />} />
+            <Route path="/mailpool/reimport-success" element={<ReimportSuccessPage />} />
           </Routes>
         </Content>
       </Layout>

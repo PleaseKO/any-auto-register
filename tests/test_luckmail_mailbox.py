@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from core.base_mailbox import LuckMailMailbox, MailboxAccount, create_mailbox
-from core.luckmail.models import TokenMailItem, TokenMailList
+from core.luckmail.models import PageResult, PurchaseItem, TokenMailItem, TokenMailList
 
 
 class LuckMailMailboxTests(unittest.TestCase):
@@ -79,6 +79,51 @@ class LuckMailMailboxTests(unittest.TestCase):
             mock_client_cls.call_args.kwargs.get("proxy_url"),
             "socks5://127.0.0.1:7890",
         )
+
+    def test_get_email_falls_back_to_existing_purchases_when_purchase_api_fails(self):
+        mailbox = self._build_mailbox()
+        mailbox._token = None
+        mailbox._email = None
+        mailbox._client.user.purchase_emails.side_effect = RuntimeError("无库存")
+        mailbox._client.user.get_purchases.return_value = PageResult(
+            list=[
+                PurchaseItem(
+                    id=1,
+                    email_address="fallback@example.com",
+                    token="tok_fallback",
+                    project_name="openai",
+                    price="0.0000",
+                    user_disabled=0,
+                )
+            ],
+            total=1,
+            page=1,
+            page_size=100,
+        )
+
+        account = mailbox.get_email()
+
+        self.assertEqual(account.email, "fallback@example.com")
+        self.assertEqual(account.account_id, "tok_fallback")
+        self.assertEqual(mailbox._token, "tok_fallback")
+        self.assertEqual(mailbox._email, "fallback@example.com")
+
+    def test_get_email_raises_when_purchase_api_fails_and_no_existing_purchase(self):
+        mailbox = self._build_mailbox()
+        mailbox._token = None
+        mailbox._email = None
+        mailbox._client.user.purchase_emails.side_effect = RuntimeError("无库存")
+        mailbox._client.user.get_purchases.return_value = PageResult(
+            list=[],
+            total=0,
+            page=1,
+            page_size=100,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            mailbox.get_email()
+
+        self.assertIn("回退已购邮箱池", str(ctx.exception))
 
 
 if __name__ == "__main__":

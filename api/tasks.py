@@ -1,10 +1,11 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
-from sqlmodel import Session, select
+from sqlmodel import Session, select, func
 from typing import Optional
 from copy import deepcopy
-from core.db import TaskLog, engine
+from core.db import TaskLog, FailedEmailReimportEventModel, engine
+from core.task_logs import build_failed_email_row, task_log_import_record
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -40,6 +41,41 @@ class RegisterTaskRequest(BaseModel):
 
 class TaskLogBatchDeleteRequest(BaseModel):
     ids: list[int]
+
+
+class FailedEmailRetryRow(BaseModel):
+    email: str
+    password: str = ""
+    client_id: str = ""
+    refresh_token: str = ""
+    fail_count: int
+    platform_count: int
+    platforms: list[str]
+    latest_log_id: int
+    latest_error: str = ""
+    latest_reason: str = ""
+    latest_created_at: Optional[str] = None
+    importable: bool = False
+    has_oauth: bool = False
+    source_mode: str = ""
+    source_label: str = ""
+    reimport_attempts: int = 0
+    reimport_imported_count: int = 0
+    reimport_duplicate_count: int = 0
+    success_after_reimport: bool = False
+    reimports_before_success: int = 0
+    first_success_at: Optional[str] = None
+
+
+class FailedEmailRetrySummaryResponse(BaseModel):
+    total: int
+    min_retry_count: int
+    items: list[FailedEmailRetryRow]
+
+
+class ReimportSuccessSummaryResponse(BaseModel):
+    total: int
+    items: list[FailedEmailRetryRow]
 
 
 def _ensure_task_exists(task_id: str) -> None:
@@ -150,15 +186,25 @@ def _query_task_logs(
     ids: list[int] | None = None,
 ):
     with Session(engine) as s:
-        q = select(TaskLog)
-        if platform:
-            q = q.where(TaskLog.platform == platform)
-        if status:
-            q = q.where(TaskLog.status == status)
-        if ids:
-            q = q.where(TaskLog.id.in_(ids))
+        q = _build_task_log_query(platform=platform, status=status, ids=ids)
         q = q.order_by(TaskLog.id.desc())
         return s.exec(q).all()
+
+
+def _build_task_log_query(
+    *,
+    platform: str | None = None,
+    status: str | None = None,
+    ids: list[int] | None = None,
+):
+    q = select(TaskLog)
+    if platform:
+        q = q.where(TaskLog.platform == platform)
+    if status:
+        q = q.where(TaskLog.status == status)
+    if ids:
+        q = q.where(TaskLog.id.in_(ids))
+    return q
 
 
 def _build_task_log_detail(
@@ -465,7 +511,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 
-        max_workers = min(req.concurrency, req.count, 5)
+        max_workers = min(req.concurrency, req.count, 20)
         stopped = False
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
@@ -486,6 +532,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     stopped = True
                 else:
                     errors.append(result.message)
+                _task_store.update_result_counts(
+                    task_id,
+                    success=success,
+                    skipped=skipped,
+                    errors=errors,
+                )
                 if stopped or control.is_stop_requested():
                     stopped = True
                     for pending in futures:
@@ -554,11 +606,304 @@ def get_logs(
     page: int = 1,
     page_size: int = 50,
 ):
-    items_all = _query_task_logs(platform=platform, status=status)
-    total = len(items_all)
-    start = max(page - 1, 0) * page_size
-    items = items_all[start : start + page_size]
+    page = max(int(page or 1), 1)
+    page_size = min(max(int(page_size or 50), 1), 500)
+    offset = (page - 1) * page_size
+    with Session(engine) as s:
+        base_query = _build_task_log_query(platform=platform, status=status)
+        count_query = select(func.count()).select_from(TaskLog)
+        if platform:
+            count_query = count_query.where(TaskLog.platform == platform)
+        if status:
+            count_query = count_query.where(TaskLog.status == status)
+        total = int(s.exec(count_query).one() or 0)
+        items = s.exec(
+            base_query.order_by(TaskLog.id.desc()).offset(offset).limit(page_size)
+        ).all()
     return {"total": total, "items": items}
+
+
+@router.get("/logs/summary")
+def get_logs_summary():
+    with Session(engine) as s:
+        rows = s.exec(
+            select(TaskLog.status, func.count())
+            .group_by(TaskLog.status)
+        ).all()
+        failed_items = s.exec(
+            select(TaskLog).where(TaskLog.status == "failed").order_by(TaskLog.id.desc())
+        ).all()
+
+    by_status = {str(status): int(count or 0) for status, count in rows}
+    failed_rows = [build_failed_email_row(item) for item in failed_items]
+    importable = sum(1 for row in failed_rows if row["importable"])
+    inferred = sum(1 for row in failed_rows if row["source_mode"])
+    return {
+        "total": sum(by_status.values()),
+        "by_status": by_status,
+        "failed_email_pool": {
+            "total": len(failed_rows),
+            "importable": importable,
+            "inferred": inferred,
+        },
+    }
+
+
+@router.get("/failed-emails")
+def get_failed_emails(
+    platform: str = "",
+    q: str = "",
+    page: int = 1,
+    page_size: int = 50,
+    dedupe: bool = True,
+    importable_only: bool = False,
+):
+    items = _query_task_logs(platform=platform or None, status="failed")
+    rows = [build_failed_email_row(item) for item in items]
+
+    keyword = str(q or "").strip().lower()
+    if keyword:
+        rows = [
+            row
+            for row in rows
+            if keyword in f"{row['email']} {row['platform']} {row['error']} {row['reason']}".lower()
+        ]
+
+    if importable_only:
+        rows = [row for row in rows if row["importable"]]
+
+    if dedupe:
+        deduped: dict[str, dict] = {}
+        for row in rows:
+            email_key = str(row["email"] or "").strip().lower()
+            if not email_key:
+                deduped[f"__empty__{row['id']}"] = row
+                continue
+            existing = deduped.get(email_key)
+            if existing is None or int(row["id"]) > int(existing["id"]):
+                deduped[email_key] = row
+        rows = sorted(deduped.values(), key=lambda x: int(x["id"]), reverse=True)
+
+    total = len(rows)
+    importable_count = sum(1 for row in rows if row["importable"])
+    inferred_count = sum(1 for row in rows if row["source_mode"])
+    page = max(int(page or 1), 1)
+    page_size = min(max(int(page_size or 50), 1), 500)
+    offset = (page - 1) * page_size
+    paged = rows[offset : offset + page_size]
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "importable": importable_count,
+        "inferred": inferred_count,
+        "items": paged,
+    }
+
+
+@router.get("/failed-emails/retry-summary", response_model=FailedEmailRetrySummaryResponse)
+def get_failed_email_retry_summary(
+    q: str = "",
+    platform: str = "",
+    min_retry_count: int = 3,
+    exact_retry_count: int = 0,
+):
+    items = _query_task_logs(platform=platform or None, status="failed")
+    with Session(engine) as s:
+        success_items = s.exec(select(TaskLog).where(TaskLog.status == "success")).all()
+        reimport_events = s.exec(select(FailedEmailReimportEventModel)).all()
+    grouped: dict[str, dict] = {}
+    success_map: dict[str, list] = {}
+    reimport_map: dict[str, list] = {}
+
+    for item in success_items:
+        email_key = str(getattr(item, "email", "") or "").strip().lower()
+        if not email_key:
+            continue
+        success_map.setdefault(email_key, []).append(item)
+
+    for event in reimport_events:
+        email_key = str(getattr(event, "email", "") or "").strip().lower()
+        if not email_key:
+            continue
+        reimport_map.setdefault(email_key, []).append(event)
+
+    for item in items:
+        row = build_failed_email_row(item)
+        email_key = str(row["email"] or "").strip().lower()
+        if not email_key:
+            continue
+
+        payload = grouped.get(email_key)
+        if payload is None:
+            payload = {
+                "email": str(row["email"] or "").strip(),
+                "fail_count": 0,
+                "platforms": set(),
+                "latest_log_id": int(row["id"] or 0),
+                "password": str(row["password"] or "").strip(),
+                "client_id": str(row["client_id"] or "").strip(),
+                "refresh_token": str(row["refresh_token"] or "").strip(),
+                "latest_error": str(row["error"] or "").strip(),
+                "latest_reason": str(row["reason"] or "").strip(),
+                "latest_created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "importable": bool(row["importable"]),
+                "has_oauth": bool(row["has_oauth"]),
+                "source_mode": str(row["source_mode"] or "").strip(),
+                "source_label": str(row["source_label"] or "").strip(),
+                "reimport_attempts": 0,
+                "reimport_imported_count": 0,
+                "reimport_duplicate_count": 0,
+                "success_after_reimport": False,
+                "reimports_before_success": 0,
+                "first_success_at": None,
+            }
+            grouped[email_key] = payload
+
+        payload["fail_count"] += 1
+        platform_name = str(row["platform"] or "").strip()
+        if platform_name:
+            payload["platforms"].add(platform_name)
+
+        if int(row["id"] or 0) >= int(payload["latest_log_id"] or 0):
+            payload["latest_log_id"] = int(row["id"] or 0)
+            payload["password"] = str(row["password"] or "").strip()
+            payload["client_id"] = str(row["client_id"] or "").strip()
+            payload["refresh_token"] = str(row["refresh_token"] or "").strip()
+            payload["latest_error"] = str(row["error"] or "").strip()
+            payload["latest_reason"] = str(row["reason"] or "").strip()
+            payload["latest_created_at"] = row["created_at"].isoformat() if row.get("created_at") else None
+            payload["importable"] = bool(row["importable"])
+            payload["has_oauth"] = bool(row["has_oauth"])
+            payload["source_mode"] = str(row["source_mode"] or "").strip()
+            payload["source_label"] = str(row["source_label"] or "").strip()
+
+    keyword = str(q or "").strip().lower()
+    exact_count = max(int(exact_retry_count or 0), 0)
+    threshold = max(int(min_retry_count or 3), 1)
+    rows: list[dict] = []
+
+    for payload in grouped.values():
+        fail_count = int(payload["fail_count"] or 0)
+        if exact_count > 0:
+            if fail_count != exact_count:
+                continue
+        elif fail_count < threshold:
+            continue
+        platforms = sorted(str(name) for name in payload["platforms"] if str(name).strip())
+        haystack = " ".join(
+            [
+                str(payload["email"] or ""),
+                str(payload["latest_error"] or ""),
+                str(payload["latest_reason"] or ""),
+                " ".join(platforms),
+            ]
+        ).lower()
+        if keyword and keyword not in haystack:
+            continue
+        rows.append(
+            {
+                "email": payload["email"],
+                "password": payload["password"],
+                "client_id": payload["client_id"],
+                "refresh_token": payload["refresh_token"],
+                "fail_count": fail_count,
+                "platform_count": len(platforms),
+                "platforms": platforms,
+                "latest_log_id": int(payload["latest_log_id"] or 0),
+                "latest_error": payload["latest_error"],
+                "latest_reason": payload["latest_reason"],
+                "latest_created_at": payload["latest_created_at"],
+                "importable": bool(payload["importable"]),
+                "has_oauth": bool(payload["has_oauth"]),
+                "source_mode": payload["source_mode"],
+                "source_label": payload["source_label"],
+                "reimport_attempts": 0,
+                "reimport_imported_count": 0,
+                "reimport_duplicate_count": 0,
+                "success_after_reimport": False,
+                "reimports_before_success": 0,
+                "first_success_at": None,
+            }
+        )
+
+    for row in rows:
+        email_key = str(row["email"] or "").strip().lower()
+        events = sorted(
+            reimport_map.get(email_key, []),
+            key=lambda item: getattr(item, "created_at", None) or "",
+        )
+        successes = sorted(
+            success_map.get(email_key, []),
+            key=lambda item: getattr(item, "created_at", None) or "",
+        )
+
+        row["reimport_attempts"] = len(events)
+        row["reimport_imported_count"] = sum(
+            1 for event in events if str(getattr(event, "result", "") or "").strip() == "imported"
+        )
+        row["reimport_duplicate_count"] = sum(
+            1 for event in events if str(getattr(event, "result", "") or "").strip() == "duplicate"
+        )
+
+        if not events or not successes:
+            continue
+
+        first_reimport_at = getattr(events[0], "created_at", None)
+        success_after_reimport = None
+        for success_item in successes:
+            success_at = getattr(success_item, "created_at", None)
+            if first_reimport_at and success_at and success_at >= first_reimport_at:
+                success_after_reimport = success_item
+                break
+
+        if success_after_reimport is None:
+            continue
+
+        success_at = getattr(success_after_reimport, "created_at", None)
+        row["success_after_reimport"] = True
+        row["first_success_at"] = success_at.isoformat() if success_at else None
+        row["reimports_before_success"] = sum(
+            1
+            for event in events
+            if getattr(event, "created_at", None) and success_at and getattr(event, "created_at", None) <= success_at
+        )
+
+    rows.sort(key=lambda item: (-int(item["fail_count"]), -int(item["latest_log_id"])))
+    return {
+        "total": len(rows),
+        "min_retry_count": exact_count or threshold,
+        "items": rows,
+    }
+
+
+@router.get("/failed-emails/reimport-success", response_model=ReimportSuccessSummaryResponse)
+def get_reimport_success_summary(
+    q: str = "",
+    platform: str = "",
+):
+    summary = get_failed_email_retry_summary(
+        q=q,
+        platform=platform,
+        min_retry_count=1,
+        exact_retry_count=0,
+    )
+    items = [
+        item
+        for item in summary["items"]
+        if bool(item.get("success_after_reimport"))
+    ]
+    items.sort(
+        key=lambda item: (
+            -int(item.get("reimports_before_success") or 0),
+            str(item.get("first_success_at") or ""),
+        ),
+        reverse=False,
+    )
+    return {
+        "total": len(items),
+        "items": items,
+    }
 
 
 @router.get("/logs/export")
@@ -593,25 +938,13 @@ def export_logs(
 
     records = []
     for item in items:
-        try:
-            detail = json.loads(item.detail_json or "{}")
-        except Exception:
-            detail = {}
-        extra = detail.get("extra") or {}
-        email = str(detail.get("email") or item.email or "").strip()
-        password = str(detail.get("password") or "").strip()
-        client_id = str(
-            extra.get("client_id") or extra.get("clientId") or extra.get("clientID") or ""
-        ).strip()
-        refresh_token = str(
-            extra.get("refresh_token") or extra.get("refreshToken") or ""
-        ).strip()
+        record = task_log_import_record(item)
         records.append(
             {
-                "email": email,
-                "password": password,
-                "clientId": client_id,
-                "refreshToken": refresh_token,
+                "email": record["email"],
+                "password": record["password"],
+                "clientId": record["client_id"],
+                "refreshToken": record["refresh_token"],
             }
         )
 

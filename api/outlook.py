@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
+import json
 import io
 from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from sqlmodel import Session, select, func
 
-from core.db import engine, OutlookAccountModel
+from core.db import engine, OutlookAccountModel, FailedEmailReimportEventModel
 
 router = APIRouter(prefix="/outlook", tags=["outlook"])
 
@@ -19,6 +20,8 @@ def _utcnow():
 class OutlookBatchImportRequest(BaseModel):
     data: str
     enabled: bool = True
+    source: str = ""
+    source_tag: str = ""
 
 
 class OutlookBatchImportResponse(BaseModel):
@@ -33,6 +36,7 @@ class OutlookAccountItem(BaseModel):
     email: str
     enabled: bool
     has_oauth: bool
+    source_tag: str = "manual"
     created_at: datetime
     updated_at: datetime
     last_used: Optional[datetime] = None
@@ -54,6 +58,66 @@ class OutlookUpdateRequest(BaseModel):
     refresh_token: Optional[str] = None
 
 
+def _parse_outlook_import_rows(data: str) -> tuple[int, list[dict[str, Any]], list[str]]:
+    lines = (data or "").splitlines()
+    total = len(lines)
+    parsed_rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_emails: set[str] = set()
+
+    for idx, raw_line in enumerate(lines):
+        line = str(raw_line or "").strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = [part.strip() for part in line.split("----")]
+        if len(parts) < 2:
+            errors.append(f"行 {idx + 1}: 格式错误，至少需要邮箱和密码")
+            continue
+
+        email = str(parts[0] or "").strip()
+        password = str(parts[1] or "").strip()
+        if "@" not in email:
+            errors.append(f"行 {idx + 1}: 无效的邮箱地址: {email}")
+            continue
+
+        email_key = email.lower()
+        if email_key in seen_emails:
+            errors.append(f"行 {idx + 1}: 请求内重复邮箱: {email}")
+            continue
+        seen_emails.add(email_key)
+
+        parsed_rows.append(
+            {
+                "line_no": idx + 1,
+                "email": email,
+                "password": password,
+                "client_id": parts[2] if len(parts) >= 3 else "",
+                "refresh_token": parts[3] if len(parts) >= 4 else "",
+            }
+        )
+
+    return total, parsed_rows, errors
+
+
+def _save_reimport_event(
+    session: Session,
+    *,
+    email: str,
+    source: str,
+    result: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    session.add(
+        FailedEmailReimportEventModel(
+            email=str(email or "").strip(),
+            source=str(source or "").strip(),
+            result=str(result or "").strip(),
+            detail_json=json.dumps(detail or {}, ensure_ascii=False),
+        )
+    )
+
+
 @router.post("/batch-import", response_model=OutlookBatchImportResponse)
 def batch_import_outlook(request: OutlookBatchImportRequest):
     """
@@ -63,70 +127,132 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
     - 邮箱----密码
     - 邮箱----密码----client_id----refresh_token
     """
-    lines = (request.data or "").splitlines()
-    total = len(lines)
+    total, parsed_rows, errors = _parse_outlook_import_rows(request.data or "")
     success = 0
-    failed = 0
     accounts: List[Dict[str, Any]] = []
-    errors: List[str] = []
+    failed = len(errors)
+
+    if not parsed_rows:
+        return OutlookBatchImportResponse(
+            total=total,
+            success=0,
+            failed=failed,
+            accounts=[],
+            errors=errors,
+        )
 
     with Session(engine) as session:
-        for idx, raw_line in enumerate(lines):
-            line = str(raw_line or "").strip()
-            if not line or line.startswith("#"):
-                continue
+        email_list = [row["email"] for row in parsed_rows]
+        existing_items = session.exec(
+            select(OutlookAccountModel).where(OutlookAccountModel.email.in_(email_list))
+        ).all()
+        existing_emails = {str(item.email or "").strip().lower() for item in existing_items}
+        source = str(request.source or "").strip()
+        source_tag = str(request.source_tag or "").strip() or (
+            "failed_reimport" if source in {"failed_email_pool", "failed_email_retry_page"} else "manual"
+        )
 
-            parts = [part.strip() for part in line.split("----")]
-            if len(parts) < 2:
+        rows_to_insert: list[dict[str, Any]] = []
+        for row in parsed_rows:
+            if row["email"].lower() in existing_emails:
                 failed += 1
-                errors.append(f"行 {idx + 1}: 格式错误，至少需要邮箱和密码")
+                errors.append(f"行 {row['line_no']}: 邮箱已存在: {row['email']}")
+                if source:
+                    _save_reimport_event(
+                        session,
+                        email=row["email"],
+                        source=source,
+                        result="duplicate",
+                        detail={"line_no": row["line_no"]},
+                    )
                 continue
+            rows_to_insert.append(row)
 
-            email = parts[0]
-            password = parts[1]
-            if "@" not in email:
-                failed += 1
-                errors.append(f"行 {idx + 1}: 无效的邮箱地址: {email}")
-                continue
+        now = _utcnow()
+        models = [
+            OutlookAccountModel(
+                email=row["email"],
+                password=row["password"],
+                client_id=row["client_id"],
+                refresh_token=row["refresh_token"],
+                enabled=bool(request.enabled),
+                source_tag=source_tag,
+                created_at=now,
+                updated_at=now,
+            )
+            for row in rows_to_insert
+        ]
 
-            existing = session.exec(
-                select(OutlookAccountModel).where(OutlookAccountModel.email == email)
-            ).first()
-            if existing:
-                failed += 1
-                errors.append(f"行 {idx + 1}: 邮箱已存在: {email}")
-                continue
-
-            client_id = parts[2] if len(parts) >= 3 else ""
-            refresh_token = parts[3] if len(parts) >= 4 else ""
-
+        if models:
             try:
-                account = OutlookAccountModel(
-                    email=email,
-                    password=password,
-                    client_id=client_id,
-                    refresh_token=refresh_token,
-                    enabled=bool(request.enabled),
-                    created_at=_utcnow(),
-                    updated_at=_utcnow(),
-                )
-                session.add(account)
+                session.add_all(models)
+                if source:
+                    for row in rows_to_insert:
+                        _save_reimport_event(
+                            session,
+                            email=row["email"],
+                            source=source,
+                            result="imported",
+                            detail={"line_no": row["line_no"]},
+                        )
                 session.commit()
-                session.refresh(account)
-
-                accounts.append(
-                    {
-                        "id": account.id,
-                        "email": account.email,
-                        "has_oauth": bool(account.client_id and account.refresh_token),
-                        "enabled": account.enabled,
-                    }
-                )
-                success += 1
+                for account in models:
+                    session.refresh(account)
+                    accounts.append(
+                        {
+                            "id": account.id,
+                            "email": account.email,
+                            "has_oauth": bool(account.client_id and account.refresh_token),
+                            "enabled": account.enabled,
+                        }
+                    )
+                success = len(models)
             except Exception as e:
                 session.rollback()
-                failed += 1
-                errors.append(f"行 {idx + 1}: 创建失败: {str(e)}")
+                for row in rows_to_insert:
+                    try:
+                        account = OutlookAccountModel(
+                            email=row["email"],
+                            password=row["password"],
+                            client_id=row["client_id"],
+                            refresh_token=row["refresh_token"],
+                            enabled=bool(request.enabled),
+                            source_tag=source_tag,
+                            created_at=_utcnow(),
+                            updated_at=_utcnow(),
+                        )
+                        session.add(account)
+                        session.commit()
+                        session.refresh(account)
+                        accounts.append(
+                            {
+                                "id": account.id,
+                                "email": account.email,
+                                "has_oauth": bool(account.client_id and account.refresh_token),
+                                "enabled": account.enabled,
+                            }
+                        )
+                        success += 1
+                    except Exception as inner_e:
+                        session.rollback()
+                        failed += 1
+                        errors.append(f"行 {row['line_no']}: 创建失败: {str(inner_e or e)}")
+                        if source:
+                            with Session(engine) as event_session:
+                                _save_reimport_event(
+                                    event_session,
+                                    email=row["email"],
+                                    source=source,
+                                    result="failed",
+                                    detail={
+                                        "line_no": row["line_no"],
+                                        "error": str(inner_e or e),
+                                    },
+                                )
+                                event_session.commit()
+
+        if source and not models:
+            session.commit()
 
     return OutlookBatchImportResponse(
         total=total,
@@ -141,6 +267,7 @@ def batch_import_outlook(request: OutlookBatchImportRequest):
 def list_outlook_accounts(
     q: str = "",
     enabled: str = "",
+    source_tag: str = "",
     page: int = 1,
     page_size: int = 50,
 ):
@@ -151,19 +278,33 @@ def list_outlook_accounts(
         query = query.where(OutlookAccountModel.email.ilike(f"%{keyword}%"))
 
     enabled_raw = str(enabled or "").strip().lower()
+    source_tag_raw = str(source_tag or "").strip().lower()
     if enabled_raw in {"true", "1", "yes"}:
         query = query.where(OutlookAccountModel.enabled == True)  # noqa: E712
     elif enabled_raw in {"false", "0", "no"}:
         query = query.where(OutlookAccountModel.enabled == False)  # noqa: E712
+    if source_tag_raw:
+        query = query.where(OutlookAccountModel.source_tag == source_tag_raw)
 
     page = max(int(page or 1), 1)
     page_size = min(max(int(page_size or 50), 10), 200)
     offset = (page - 1) * page_size
 
     with Session(engine) as session:
-        all_items = session.exec(query.order_by(OutlookAccountModel.id.desc())).all()
-        total = len(all_items)
-        items = all_items[offset : offset + page_size]
+        count_query = select(func.count()).select_from(OutlookAccountModel)
+        if keyword:
+            count_query = count_query.where(OutlookAccountModel.email.ilike(f"%{keyword}%"))
+        if enabled_raw in {"true", "1", "yes"}:
+            count_query = count_query.where(OutlookAccountModel.enabled == True)  # noqa: E712
+        elif enabled_raw in {"false", "0", "no"}:
+            count_query = count_query.where(OutlookAccountModel.enabled == False)  # noqa: E712
+        if source_tag_raw:
+            count_query = count_query.where(OutlookAccountModel.source_tag == source_tag_raw)
+
+        total = int(session.exec(count_query).one() or 0)
+        items = session.exec(
+            query.order_by(OutlookAccountModel.id.desc()).offset(offset).limit(page_size)
+        ).all()
 
     return OutlookListResponse(
         total=total,
@@ -173,6 +314,7 @@ def list_outlook_accounts(
                 email=item.email,
                 enabled=bool(item.enabled),
                 has_oauth=bool(item.client_id and item.refresh_token),
+                source_tag=str(item.source_tag or "manual"),
                 created_at=item.created_at,
                 updated_at=item.updated_at,
                 last_used=item.last_used,
@@ -207,7 +349,10 @@ def export_outlook_accounts(
     return StreamingResponse(
         iter([data]),
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=outlook_accounts.txt"},
+        headers={
+            "Content-Disposition": "attachment; filename=outlook_accounts.txt",
+            "Cache-Control": "no-store",
+        },
     )
 
 
