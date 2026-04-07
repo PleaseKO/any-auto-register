@@ -33,6 +33,11 @@ import { useSearchParams } from 'react-router-dom'
 
 const { Text } = Typography
 
+function resolveEffectiveMailProvider(mailProvider: string, mailImportSource: string) {
+  if (mailProvider !== 'mail_import') return mailProvider
+  return mailImportSource === 'applemail' ? 'applemail' : 'microsoft'
+}
+
 export default function RegisterTaskPage() {
   const [form] = Form.useForm()
   const [searchParams] = useSearchParams()
@@ -45,10 +50,13 @@ export default function RegisterTaskPage() {
   useEffect(() => {
     apiFetch('/config').then((cfg) => {
       const currentPlatform = form.getFieldValue('platform') || 'trae'
+      const configMailProvider = String(cfg.mail_provider || 'luckmail')
+      const isMailImportProvider = configMailProvider === 'microsoft' || configMailProvider === 'outlook' || configMailProvider === 'applemail'
       form.setFieldsValue({
         executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-        mail_provider: cfg.mail_provider || 'luckmail',
+        mail_provider: isMailImportProvider ? 'mail_import' : configMailProvider,
+        mail_import_source: configMailProvider === 'applemail' ? 'applemail' : 'microsoft',
         applemail_base_url: cfg.applemail_base_url || 'https://www.appleemail.top',
         applemail_pool_dir: cfg.applemail_pool_dir || 'mail',
         applemail_pool_file: cfg.applemail_pool_file || '',
@@ -65,6 +73,7 @@ export default function RegisterTaskPage() {
         cloudmail_domain: cfg.cloudmail_domain || '',
         cloudmail_subdomain: cfg.cloudmail_subdomain || '',
         cloudmail_timeout: cfg.cloudmail_timeout || 30,
+        outlook_backend: cfg.outlook_backend || 'graph',
         laoudo_auth: cfg.laoudo_auth || '',
         laoudo_email: cfg.laoudo_email || '',
         laoudo_account_id: cfg.laoudo_account_id || '',
@@ -131,8 +140,9 @@ export default function RegisterTaskPage() {
 
   const submit = async () => {
     const values = await form.validateFields()
+    const effectiveMailProvider = resolveEffectiveMailProvider(values.mail_provider, values.mail_import_source)
     const registerExtra = {
-      mail_provider: values.mail_provider,
+      mail_provider: effectiveMailProvider,
       applemail_base_url: values.applemail_base_url,
       applemail_pool_dir: values.applemail_pool_dir,
       applemail_pool_file: values.applemail_pool_file,
@@ -161,6 +171,7 @@ export default function RegisterTaskPage() {
       cloudmail_domain: values.cloudmail_domain,
       cloudmail_subdomain: values.cloudmail_subdomain,
       cloudmail_timeout: values.cloudmail_timeout,
+      outlook_backend: values.outlook_backend,
       duckmail_api_url: values.duckmail_api_url,
       duckmail_provider_url: values.duckmail_provider_url,
       duckmail_bearer: values.duckmail_bearer,
@@ -237,7 +248,9 @@ export default function RegisterTaskPage() {
     }, 2000)
   }
 
-  const mailProvider = Form.useWatch('mail_provider', form)
+  const mailProviderRaw = Form.useWatch('mail_provider', form)
+  const mailImportSource = Form.useWatch('mail_import_source', form)
+  const mailProvider = resolveEffectiveMailProvider(String(mailProviderRaw || ''), String(mailImportSource || 'microsoft'))
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
   const executorOptions = getExecutorOptions(platform)
@@ -270,9 +283,11 @@ export default function RegisterTaskPage() {
         executor_type: 'protocol',
         captcha_solver: 'yescaptcha',
         mail_provider: 'luckmail',
+        mail_import_source: 'microsoft',
         applemail_base_url: 'https://www.appleemail.top',
         applemail_pool_dir: 'mail',
         applemail_mailboxes: 'INBOX,Junk',
+        outlook_backend: 'graph',
         gptmail_base_url: 'https://mail.chatgpt.org.uk',
         cloudmail_timeout: 30,
         count: 1,
@@ -339,7 +354,7 @@ export default function RegisterTaskPage() {
             <Select
               options={[
                 { value: 'luckmail', label: 'LuckMail' },
-                { value: 'applemail', label: 'AppleMail / 小苹果' },
+                { value: 'mail_import', label: '邮箱导入' },
                 { value: 'moemail', label: 'MoeMail (sall.cc)' },
                 { value: 'tempmail_lol', label: 'TempMail.lol' },
                 { value: 'skymail', label: 'SkyMail (CloudMail)' },
@@ -355,6 +370,30 @@ export default function RegisterTaskPage() {
               ]}
             />
           </Form.Item>
+          {mailProviderRaw === 'mail_import' && (
+            <Form.Item name="mail_import_source" label="导入类型" rules={[{ required: true }]}>
+              <Select
+                options={[
+                  { value: 'microsoft', label: '微软邮箱（Outlook / Hotmail）' },
+                  { value: 'applemail', label: 'AppleMail / 小苹果' },
+                ]}
+              />
+            </Form.Item>
+          )}
+          {mailProvider === 'microsoft' && (
+            <Form.Item
+              name="outlook_backend"
+              label="微软收信方式"
+              extra="默认使用 Graph；若账号没有 OAuth 凭据，运行时会自动回退到 IMAP。"
+            >
+              <Select
+                options={[
+                  { value: 'graph', label: 'Graph（默认）' },
+                  { value: 'imap', label: 'IMAP' },
+                ]}
+              />
+            </Form.Item>
+          )}
           {mailProvider === 'skymail' && (
             <>
               <Form.Item name="skymail_api_base" label="API Base">
@@ -571,7 +610,14 @@ export default function RegisterTaskPage() {
                 />
               </Form.Item>
               <Form.Item name="luckmail_email_type" label="邮箱类型（可选）">
-                <Input placeholder="ms_graph / ms_imap" />
+                <Select
+                  options={[
+                    { value: '', label: '自动 / 留空' },
+                    { value: 'ms_graph', label: '微软邮箱 - Graph' },
+                    { value: 'ms_imap', label: '微软邮箱 - IMAP' },
+                    { value: 'self_built', label: '自建邮箱' },
+                  ]}
+                />
               </Form.Item>
               <Form.Item name="luckmail_domain" label="邮箱域名（可选）">
                 <Input placeholder="outlook.com" />
