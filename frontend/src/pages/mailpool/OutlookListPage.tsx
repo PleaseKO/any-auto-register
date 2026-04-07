@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Button, Card, Input, Space, Table, Tag, Typography, message } from 'antd'
+import { Button, Card, Input, Modal, Progress, Space, Table, Tag, Typography, message } from 'antd'
 import { ReloadOutlined, UploadOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { useNavigate } from 'react-router-dom'
@@ -39,6 +39,9 @@ export default function OutlookListPage() {
   const [q, setQ] = useState('')
   const [enabled, setEnabled] = useState('')
   const [sourceTag, setSourceTag] = useState('')
+  const [checkLoading, setCheckLoading] = useState(false)
+  const [checkProgressOpen, setCheckProgressOpen] = useState(false)
+  const [checkProgress, setCheckProgress] = useState({ total: 0, current: 0, currentEmail: '' })
 
   const load = async () => {
     setLoading(true)
@@ -110,6 +113,91 @@ export default function OutlookListPage() {
     }
   }
 
+  const handleCheckHealth = async () => {
+    setCheckLoading(true)
+    try {
+      const items = data?.items || []
+      if (!items.length) {
+        message.info('当前没有可检测的 Outlook 邮箱')
+        return
+      }
+
+      setCheckProgress({ total: items.length, current: 0, currentEmail: '' })
+      setCheckProgressOpen(true)
+
+      let checked = 0
+      let healthy = 0
+      let invalid = 0
+      let disabled = 0
+      const invalidItems: Array<{ email: string; reason: string }> = []
+
+      for (const item of items) {
+        setCheckProgress({ total: items.length, current: checked, currentEmail: item.email })
+        const result = await apiFetch('/outlook/check-health', {
+          method: 'POST',
+          body: JSON.stringify({
+            ids: [item.id],
+            disable_invalid: true,
+            limit: 1,
+          }),
+        })
+        checked += Number(result.checked || 0)
+        healthy += Number(result.healthy || 0)
+        invalid += Number(result.invalid || 0)
+        disabled += Number(result.disabled || 0)
+        const failedRows = (result.items || []).filter((row: any) => !row.valid)
+        invalidItems.push(
+          ...failedRows.map((row: any) => ({
+            email: String(row.email || ''),
+            reason: String(row.reason || 'unknown'),
+          })),
+        )
+        setCheckProgress({ total: items.length, current: checked, currentEmail: item.email })
+      }
+
+      const result = { checked, healthy, invalid, disabled, items: invalidItems }
+      if (!result.checked) {
+        message.info('当前没有可检测的 Outlook 邮箱')
+      } else if (!result.invalid) {
+        message.success(`检测完成：正常 ${result.healthy} / ${result.checked}`)
+      } else {
+        message.warning(`检测完成：异常 ${result.invalid}，已禁用 ${result.disabled} / ${result.checked}`)
+      }
+
+      if (invalidItems.length > 0) {
+        Modal.info({
+          title: '异常邮箱检测结果',
+          width: 760,
+          content: (
+            <pre
+              style={{
+                margin: 0,
+                maxHeight: 360,
+                overflow: 'auto',
+                padding: 12,
+                borderRadius: 8,
+                background: 'rgba(127,127,127,0.08)',
+                fontSize: 12,
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {invalidItems.map((item) => `${item.email} | ${item.reason || 'unknown'}`).join('\n')}
+            </pre>
+          ),
+        })
+      }
+      await load()
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : '批量检测失败'
+      message.error(msg || '批量检测失败')
+    } finally {
+      setCheckProgressOpen(false)
+      setCheckLoading(false)
+    }
+  }
+
   const columns: ColumnsType<OutlookAccount> = [
     { title: '邮箱', dataIndex: 'email' },
     {
@@ -149,6 +237,7 @@ export default function OutlookListPage() {
       extra={
         <Space size={8}>
           <Button icon={<ReloadOutlined />} onClick={() => void load()} loading={loading}>刷新</Button>
+          <Button loading={checkLoading} onClick={() => void handleCheckHealth()}>检测异常邮箱</Button>
           <Button onClick={() => void handleExport()}>导出</Button>
           <Button type="primary" icon={<UploadOutlined />} onClick={() => navigate('/mailpool/outlook/import')}>导入邮箱</Button>
         </Space>
@@ -178,6 +267,27 @@ export default function OutlookListPage() {
           pagination={{ pageSize: 50, showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200] }}
         />
       </Space>
+      <Modal
+        title="检测异常邮箱"
+        open={checkProgressOpen}
+        footer={null}
+        onCancel={() => setCheckProgressOpen(false)}
+        closable
+        maskClosable
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <Progress
+            percent={checkProgress.total > 0 ? Math.round((checkProgress.current / checkProgress.total) * 100) : 0}
+            status="active"
+          />
+          <Typography.Text type="secondary">
+            当前进度：{checkProgress.current}/{checkProgress.total}
+          </Typography.Text>
+          <Typography.Text>
+            当前邮箱：{checkProgress.currentEmail || '-'}
+          </Typography.Text>
+        </Space>
+      </Modal>
     </Card>
   )
 }

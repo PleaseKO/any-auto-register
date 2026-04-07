@@ -371,3 +371,49 @@ def backfill_chatgpt_account_to_cpa(
         session.commit()
         session.refresh(account)
     return {"ok": True, "uploaded": True, "skipped": False, "message": verify_msg, "results": results}
+
+
+def _sub2api_missing(sync_result: dict[str, Any]) -> bool:
+    if not isinstance(sync_result, dict):
+        return True
+    return not bool(sync_result.get("uploaded") or sync_result.get("uploaded_at"))
+
+
+def backfill_chatgpt_account_to_sub2api(
+    account: AccountModel,
+    *,
+    session: Session | None = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    from platforms.chatgpt.status_probe import probe_local_chatgpt_status
+    from platforms.chatgpt.sub2api_upload import upload_to_sub2api
+
+    results: list[dict[str, Any]] = []
+    cached_sync = get_sub2api_sync_state(account)
+
+    if not _sub2api_missing(cached_sync):
+        msg = "Sub2API 已上传，跳过补传"
+        results.append({"name": "Sub2API 同步", "ok": True, "msg": msg})
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
+
+    probe = probe_local_chatgpt_status(build_chatgpt_sync_account(account), proxy=None)
+    update_account_model_local_probe(account, probe, session=session, commit=False)
+    if not _local_probe_uploadable(probe):
+        auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
+        msg = auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
+        results.append({"name": "本地状态探测", "ok": False, "msg": msg})
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+
+    ok, msg = upload_to_sub2api(build_chatgpt_sync_account(account))
+    update_account_model_sub2api_sync(account, ok, msg, session=session, commit=False)
+    results.append({"name": "Sub2API 上传", "ok": ok, "msg": msg})
+    if session is not None and commit:
+        session.commit()
+        session.refresh(account)
+    return {"ok": ok, "uploaded": ok, "skipped": False, "message": msg, "results": results}

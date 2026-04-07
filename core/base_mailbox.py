@@ -3221,7 +3221,7 @@ class OutlookMailbox(BaseMailbox):
             "Deleted Items",
         )
 
-    def _try_pop_account(self) -> Optional[dict]:
+    def _try_claim_account(self) -> Optional[dict]:
         from sqlmodel import Session, select
         from core.db import engine, OutlookAccountModel
 
@@ -3256,17 +3256,96 @@ class OutlookMailbox(BaseMailbox):
                     "refresh_token": account.refresh_token,
                     "source_tag": account.source_tag,
                 }
-                session.delete(account)
+                account.enabled = False
+                session.add(account)
                 session.commit()
                 return payload
+
+    def _finalize_claimed_account(self, account_id: str, *, keep_disabled: bool) -> None:
+        from sqlmodel import Session
+        from core.db import engine, OutlookAccountModel
+
+        try:
+            account_pk = int(account_id or 0)
+        except (TypeError, ValueError):
+            return
+        if account_pk <= 0:
+            return
+
+        with self._lock:
+            with Session(engine) as session:
+                account = session.get(OutlookAccountModel, account_pk)
+                if not account:
+                    return
+                if keep_disabled:
+                    account.enabled = False
+                    session.add(account)
+                else:
+                    session.delete(account)
+                session.commit()
+
+    def _build_mailbox_account(self, payload: dict) -> MailboxAccount:
+        return MailboxAccount(
+            email=str(payload.get("email") or "").strip(),
+            account_id=str(payload.get("id") or ""),
+            extra={
+                "provider": "outlook",
+                "password": payload.get("password") or "",
+                "client_id": payload.get("client_id") or "",
+                "refresh_token": payload.get("refresh_token") or "",
+            },
+        )
+
+    def _validate_claimed_account(self, payload: dict) -> tuple[bool, str]:
+        account = self._build_mailbox_account(payload)
+        extra = account.extra or {}
+        email = str(account.email or "").strip()
+        client_id = str(extra.get("client_id") or "").strip()
+        refresh_token = str(extra.get("refresh_token") or "").strip()
+
+        if client_id and refresh_token:
+            try:
+                access_token = self._fetch_graph_access_token(
+                    email=email,
+                    client_id=client_id,
+                    refresh_token=refresh_token,
+                )
+                if access_token:
+                    return True, "graph_ok"
+            except Exception as exc:
+                return False, f"graph_error: {exc}"
+
+        try:
+            imap_conn = self._open_imap(account)
+            try:
+                imap_conn.logout()
+            except Exception:
+                pass
+            return True, "imap_ok"
+        except Exception as exc:
+            return False, f"imap_error: {exc}"
 
     def get_email(self) -> MailboxAccount:
         logged_waiting = False
         while True:
             self._checkpoint()
-            payload = self._try_pop_account()
+            payload = self._try_claim_account()
             if payload:
-                break
+                valid, reason = self._validate_claimed_account(payload)
+                if valid:
+                    self._finalize_claimed_account(
+                        str(payload.get("id") or ""),
+                        keep_disabled=False,
+                    )
+                    break
+                self._log(
+                    f"[Outlook] 跳过异常邮箱: {str(payload.get('email') or '').strip()} ({reason})"
+                )
+                self._finalize_claimed_account(
+                    str(payload.get("id") or ""),
+                    keep_disabled=True,
+                )
+                continue
             if not logged_waiting:
                 if self._source_tag_filter:
                     self._log(
@@ -3283,16 +3362,7 @@ class OutlookMailbox(BaseMailbox):
         self._email = email
         self._last_account_payload = dict(payload)
         self._log(f"[Outlook] 取出账号: {email}（已从本地池移除）")
-        return MailboxAccount(
-            email=email,
-            account_id=str(payload.get("id") or ""),
-            extra={
-                "provider": "outlook",
-                "password": payload.get("password") or "",
-                "client_id": payload.get("client_id") or "",
-                "refresh_token": payload.get("refresh_token") or "",
-            },
-        )
+        return self._build_mailbox_account(payload)
 
     def _token_endpoints(self) -> list[str]:
         if self._token_endpoint:

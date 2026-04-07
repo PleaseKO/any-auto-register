@@ -559,7 +559,11 @@ export default function Accounts() {
   const [registerTask, setRegisterTask] = useState<any>(null)
   const [registerTaskPolling, setRegisterTaskPolling] = useState(false)
   const [registerLogVisible, setRegisterLogVisible] = useState(true)
-  const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
+  const [integrationSyncLoading, setIntegrationSyncLoading] = useState<
+    'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected' | ''
+  >('')
+  const [sub2apiProgressOpen, setSub2apiProgressOpen] = useState(false)
+  const [sub2apiProgress, setSub2apiProgress] = useState({ total: 0, current: 0, currentEmail: '' })
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
   const persistRegisterTaskSnapshot = useCallback((nextTaskId: string | null, platformName: string) => {
@@ -1010,11 +1014,15 @@ export default function Accounts() {
     })
   }
 
-  const handleCpaBackfill = async (mode: 'pending' | 'selected') => {
+  const handleIntegrationBackfill = async (
+    target: 'cliproxyapi' | 'sub2api',
+    mode: 'pending' | 'selected',
+  ) => {
     if (currentPlatform !== 'chatgpt') return
 
     const body: Record<string, unknown> = {
       platforms: ['chatgpt'],
+      target,
     }
 
     if (mode === 'selected') {
@@ -1033,14 +1041,89 @@ export default function Accounts() {
       if (search) body.email = search
     }
 
-    setCpaSyncLoading(mode)
+    const loadingKey = `${target}_${mode}` as typeof integrationSyncLoading
+    setIntegrationSyncLoading(loadingKey)
     try {
+      if (target === 'sub2api') {
+        const accountIds =
+          mode === 'selected'
+            ? Array.from(selectedRowKeys)
+                .map((value) => Number(value))
+                .filter((value) => Number.isInteger(value) && value > 0)
+            : (accounts || []).map((item: any) => Number(item.id)).filter((value) => Number.isInteger(value) && value > 0)
+
+        const targetAccounts =
+          mode === 'selected'
+            ? (accounts || []).filter((item: any) => accountIds.includes(Number(item.id)))
+            : (accounts || [])
+
+        if (!targetAccounts.length) {
+          message.info('当前没有可处理的账号')
+          return
+        }
+
+        setSub2apiProgress({ total: targetAccounts.length, current: 0, currentEmail: '' })
+        setSub2apiProgressOpen(true)
+
+        let success = 0
+        let failed = 0
+        let skipped = 0
+        const items: any[] = []
+
+        for (let index = 0; index < targetAccounts.length; index += 1) {
+          const account = targetAccounts[index]
+          setSub2apiProgress({
+            total: targetAccounts.length,
+            current: index,
+            currentEmail: String(account.email || ''),
+          })
+          const result = await apiFetch('/integrations/backfill', {
+            method: 'POST',
+            body: JSON.stringify({
+              platforms: ['chatgpt'],
+              target: 'sub2api',
+              account_ids: [Number(account.id)],
+            }),
+          })
+          success += Number(result.success || 0)
+          failed += Number(result.failed || 0)
+          skipped += Number(result.skipped || 0)
+          items.push(...(result.items || []))
+          setSub2apiProgress({
+            total: targetAccounts.length,
+            current: index + 1,
+            currentEmail: String(account.email || ''),
+          })
+        }
+
+        const actionLabel = mode === 'selected' ? '所选账号 Sub2API 补传' : 'Sub2API 未上传账号补传'
+        const result = { total: targetAccounts.length, success, failed, skipped, items }
+        if (!result.total) {
+          message.info('没有可处理的账号')
+        } else if (!result.failed && !result.skipped) {
+          message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
+        } else if (!result.failed) {
+          message.success(`${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        } else if (!result.success) {
+          message.error(`${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        } else {
+          message.warning(`${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        }
+        showCpaSyncResult(`${actionLabel}结果`, result)
+        await load()
+        return
+      }
+
       const result = await apiFetch('/integrations/backfill', {
         method: 'POST',
         body: JSON.stringify(body),
       })
 
-      const actionLabel = mode === 'selected' ? '所选账号远端补传' : '远端未发现账号补传'
+      const targetLabel = '远端'
+      const actionLabel =
+        mode === 'selected'
+          ? `所选账号${targetLabel}补传`
+          : `${targetLabel}未上传账号补传`
       if (!result.total) {
         message.info('没有可处理的账号')
       } else if (!result.failed && !result.skipped) {
@@ -1056,9 +1139,10 @@ export default function Accounts() {
       showCpaSyncResult(`${actionLabel}结果`, result)
       await load()
     } catch (e: any) {
-      message.error(`CPA 上传失败: ${e.message}`)
+      message.error(`${target === 'sub2api' ? 'Sub2API' : '补传'}失败: ${e.message}`)
     } finally {
-      setCpaSyncLoading('')
+      setSub2apiProgressOpen(false)
+      setIntegrationSyncLoading('')
     }
   }
 
@@ -1126,6 +1210,12 @@ export default function Accounts() {
     const scope = getBackfillScope()
     const count = scope === 'selected' ? selectedRowKeys.length : total
     return scope === 'selected' ? `补传所选远端未发现 (${count})` : `补传远端未发现 (${count})`
+  }
+
+  const sub2apiBackfillButtonLabel = () => {
+    const scope = getBackfillScope()
+    const count = scope === 'selected' ? selectedRowKeys.length : total
+    return scope === 'selected' ? `补传所选 Sub2API 未上传 (${count})` : `补传 Sub2API 未上传 (${count})`
   }
 
   const isChatgptPlatform = currentPlatform === 'chatgpt'
@@ -1426,14 +1516,32 @@ export default function Accounts() {
                   ? `确认补传所选 ${selectedRowKeys.length} 个账号中远端未发现的 auth-file？`
                   : '确认补传当前筛选范围内远端未发现且本地状态有效的账号？'
               }
-              onConfirm={() => handleCpaBackfill(getBackfillScope())}
+              onConfirm={() => handleIntegrationBackfill('cliproxyapi', getBackfillScope())}
             >
               <Button
-                loading={cpaSyncLoading === 'pending' || cpaSyncLoading === 'selected'}
+                loading={integrationSyncLoading === 'cliproxyapi_pending' || integrationSyncLoading === 'cliproxyapi_selected'}
                 icon={<UploadOutlined />}
                 disabled={getBackfillScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
               >
                 {backfillButtonLabel()}
+              </Button>
+            </Popconfirm>
+          )}
+          {currentPlatform === 'chatgpt' && (
+            <Popconfirm
+              title={
+                getBackfillScope() === 'selected'
+                  ? `确认补传所选 ${selectedRowKeys.length} 个账号中 Sub2API 未上传的账号？`
+                  : '确认补传当前筛选范围内 Sub2API 未上传且本地状态有效的账号？'
+              }
+              onConfirm={() => handleIntegrationBackfill('sub2api', getBackfillScope())}
+            >
+              <Button
+                loading={integrationSyncLoading === 'sub2api_pending' || integrationSyncLoading === 'sub2api_selected'}
+                icon={<UploadOutlined />}
+                disabled={getBackfillScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
+              >
+                {sub2apiBackfillButtonLabel()}
               </Button>
             </Popconfirm>
           )}
@@ -1512,6 +1620,9 @@ export default function Accounts() {
                 <Text copyable style={{ fontFamily: 'monospace' }}>{registerTask?.id || taskId}</Text>
               </Descriptions.Item>
               <Descriptions.Item label="进度">{registerTask?.progress || '-'}</Descriptions.Item>
+              <Descriptions.Item label="失败邮箱数">
+                {Number(registerTask?.failed ?? registerTask?.errors?.length ?? 0)}
+              </Descriptions.Item>
               <Descriptions.Item label="跳过">{registerTask?.skipped ?? 0}</Descriptions.Item>
             </Descriptions>
             <div style={{ marginTop: 12 }}>
@@ -1569,6 +1680,25 @@ export default function Accounts() {
             </div>
           </>
         )}
+      </Modal>
+      <Modal
+        title="补传 Sub2API"
+        open={sub2apiProgressOpen}
+        footer={null}
+        onCancel={() => setSub2apiProgressOpen(false)}
+        closable
+        maskClosable
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <Progress
+            percent={sub2apiProgress.total > 0 ? Math.round((sub2apiProgress.current / sub2apiProgress.total) * 100) : 0}
+            status="active"
+          />
+          <Text type="secondary">
+            当前进度：{sub2apiProgress.current}/{sub2apiProgress.total}
+          </Text>
+          <Text>当前账号：{sub2apiProgress.currentEmail || '-'}</Text>
+        </Space>
       </Modal>
 
       <Modal

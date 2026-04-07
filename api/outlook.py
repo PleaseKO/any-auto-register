@@ -51,6 +51,15 @@ class OutlookBatchDeleteRequest(BaseModel):
     ids: List[int]
 
 
+class OutlookHealthCheckRequest(BaseModel):
+    ids: List[int] = []
+    q: str = ""
+    enabled: str = "true"
+    source_tag: str = ""
+    disable_invalid: bool = True
+    limit: int = 200
+
+
 class OutlookUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     password: Optional[str] = None
@@ -467,6 +476,83 @@ def export_outlook_accounts(
             "Cache-Control": "no-store",
         },
     )
+
+
+@router.post("/check-health")
+def check_outlook_accounts_health(request: OutlookHealthCheckRequest):
+    from core.base_mailbox import create_mailbox
+
+    ids = [int(x) for x in (request.ids or []) if int(x) > 0]
+    q = str(request.q or "").strip()
+    enabled_raw = str(request.enabled or "").strip().lower()
+    source_tag_raw = str(request.source_tag or "").strip().lower()
+    disable_invalid = bool(request.disable_invalid)
+    limit = min(max(int(request.limit or 200), 1), 1000)
+
+    query = select(OutlookAccountModel)
+    if ids:
+        query = query.where(OutlookAccountModel.id.in_(ids))
+    if q:
+        query = query.where(OutlookAccountModel.email.ilike(f"%{q}%"))
+    if enabled_raw in {"true", "1", "yes"}:
+        query = query.where(OutlookAccountModel.enabled == True)  # noqa: E712
+    elif enabled_raw in {"false", "0", "no"}:
+        query = query.where(OutlookAccountModel.enabled == False)  # noqa: E712
+    if source_tag_raw:
+        query = query.where(OutlookAccountModel.source_tag == source_tag_raw)
+
+    mailbox = create_mailbox(provider="outlook", extra={}, proxy=None)
+    results: list[dict[str, Any]] = []
+    checked = 0
+    healthy = 0
+    invalid = 0
+    disabled = 0
+
+    with Session(engine) as session:
+        rows = session.exec(
+            query.order_by(OutlookAccountModel.id.asc()).limit(limit)
+        ).all()
+
+        for row in rows:
+            payload = {
+                "id": row.id,
+                "email": row.email,
+                "password": row.password,
+                "client_id": row.client_id,
+                "refresh_token": row.refresh_token,
+                "source_tag": row.source_tag,
+            }
+            valid, reason = mailbox._validate_claimed_account(payload)  # type: ignore[attr-defined]
+            checked += 1
+            if valid:
+                healthy += 1
+            else:
+                invalid += 1
+                if disable_invalid and row.enabled:
+                    row.enabled = False
+                    row.updated_at = _utcnow()
+                    session.add(row)
+                    disabled += 1
+            results.append(
+                {
+                    "id": int(row.id or 0),
+                    "email": row.email,
+                    "valid": bool(valid),
+                    "reason": str(reason or ""),
+                    "enabled": bool(row.enabled),
+                    "source_tag": str(row.source_tag or "manual"),
+                }
+            )
+
+        session.commit()
+
+    return {
+        "checked": checked,
+        "healthy": healthy,
+        "invalid": invalid,
+        "disabled": disabled,
+        "items": results,
+    }
 
 
 @router.post("/batch-delete")

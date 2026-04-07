@@ -697,6 +697,9 @@ export default function RegisterTaskPage() {
               <Text copyable style={{ fontFamily: 'monospace' }}>{task.id}</Text>
             </Descriptions.Item>
             <Descriptions.Item label="进度">{task.progress}</Descriptions.Item>
+            <Descriptions.Item label="失败邮箱数">
+              {Number(task.failed ?? task.errors?.length ?? 0)}
+            </Descriptions.Item>
             <Descriptions.Item label="跳过">{task.skipped ?? 0}</Descriptions.Item>
           </Descriptions>
           <div style={{ marginTop: 12 }}>
