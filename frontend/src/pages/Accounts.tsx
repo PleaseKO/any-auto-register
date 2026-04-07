@@ -563,6 +563,7 @@ export default function Accounts() {
     'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected' | ''
   >('')
   const [sub2apiProgressOpen, setSub2apiProgressOpen] = useState(false)
+  const [sub2apiProgressRunning, setSub2apiProgressRunning] = useState(false)
   const [sub2apiProgress, setSub2apiProgress] = useState({ total: 0, current: 0, currentEmail: '' })
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
@@ -614,6 +615,25 @@ export default function Accounts() {
     } finally {
       setLoading(false)
     }
+  }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd])
+
+  const fetchAllFilteredAccounts = useCallback(async () => {
+    const allItems: any[] = []
+    let page = 1
+    const pageSize = 500
+    while (true) {
+      const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
+      if (search) params.set('email', search)
+      if (filterStatus) params.set('status', filterStatus)
+      if (createdAtStart) params.set('created_at_start', createdAtStart)
+      if (createdAtEnd) params.set('created_at_end', createdAtEnd)
+      const res = await apiFetch(`/accounts?${params.toString()}`)
+      const chunk = (res.items || []).map(normalizeAccount)
+      allItems.push(...chunk)
+      if (chunk.length < pageSize || allItems.length >= Number(res.total || 0)) break
+      page += 1
+    }
+    return allItems
   }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd])
 
   useEffect(() => {
@@ -1050,12 +1070,12 @@ export default function Accounts() {
             ? Array.from(selectedRowKeys)
                 .map((value) => Number(value))
                 .filter((value) => Number.isInteger(value) && value > 0)
-            : (accounts || []).map((item: any) => Number(item.id)).filter((value) => Number.isInteger(value) && value > 0)
+            : []
 
         const targetAccounts =
           mode === 'selected'
             ? (accounts || []).filter((item: any) => accountIds.includes(Number(item.id)))
-            : (accounts || [])
+            : await fetchAllFilteredAccounts()
 
         if (!targetAccounts.length) {
           message.info('当前没有可处理的账号')
@@ -1063,6 +1083,7 @@ export default function Accounts() {
         }
 
         setSub2apiProgress({ total: targetAccounts.length, current: 0, currentEmail: '' })
+        setSub2apiProgressRunning(true)
         setSub2apiProgressOpen(true)
 
         let success = 0
@@ -1141,7 +1162,7 @@ export default function Accounts() {
     } catch (e: any) {
       message.error(`${target === 'sub2api' ? 'Sub2API' : '补传'}失败: ${e.message}`)
     } finally {
-      setSub2apiProgressOpen(false)
+      setSub2apiProgressRunning(false)
       setIntegrationSyncLoading('')
     }
   }
@@ -1545,6 +1566,9 @@ export default function Accounts() {
               </Button>
             </Popconfirm>
           )}
+          {currentPlatform === 'chatgpt' && sub2apiProgressRunning && !sub2apiProgressOpen ? (
+            <Button onClick={() => setSub2apiProgressOpen(true)}>重新打开 Sub2API 进度</Button>
+          ) : null}
           {selectedRowKeys.length > 0 && (
             <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={handleBatchDelete}>
               <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>

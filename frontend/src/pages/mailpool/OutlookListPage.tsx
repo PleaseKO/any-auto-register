@@ -41,7 +41,28 @@ export default function OutlookListPage() {
   const [sourceTag, setSourceTag] = useState('')
   const [checkLoading, setCheckLoading] = useState(false)
   const [checkProgressOpen, setCheckProgressOpen] = useState(false)
+  const [checkProgressRunning, setCheckProgressRunning] = useState(false)
   const [checkProgress, setCheckProgress] = useState({ total: 0, current: 0, currentEmail: '' })
+
+  const fetchAllOutlookItems = async (): Promise<OutlookAccount[]> => {
+    const allItems: OutlookAccount[] = []
+    let page = 1
+    const pageSize = 200
+    while (true) {
+      const params = new URLSearchParams()
+      if (String(q || '').trim()) params.set('q', String(q || '').trim())
+      if (String(enabled || '').trim()) params.set('enabled', String(enabled || '').trim())
+      if (String(sourceTag || '').trim()) params.set('source_tag', String(sourceTag || '').trim())
+      params.set('page', String(page))
+      params.set('page_size', String(pageSize))
+      const res = await apiFetch(`/outlook?${params.toString()}`) as OutlookListResponse
+      const chunk = res.items || []
+      allItems.push(...chunk)
+      if (chunk.length < pageSize || allItems.length >= Number(res.total || 0)) break
+      page += 1
+    }
+    return allItems
+  }
 
   const load = async () => {
     setLoading(true)
@@ -116,13 +137,14 @@ export default function OutlookListPage() {
   const handleCheckHealth = async () => {
     setCheckLoading(true)
     try {
-      const items = data?.items || []
+      const items = await fetchAllOutlookItems()
       if (!items.length) {
         message.info('当前没有可检测的 Outlook 邮箱')
         return
       }
 
       setCheckProgress({ total: items.length, current: 0, currentEmail: '' })
+      setCheckProgressRunning(true)
       setCheckProgressOpen(true)
 
       let checked = 0
@@ -193,7 +215,7 @@ export default function OutlookListPage() {
       const msg = error instanceof Error ? error.message : '批量检测失败'
       message.error(msg || '批量检测失败')
     } finally {
-      setCheckProgressOpen(false)
+      setCheckProgressRunning(false)
       setCheckLoading(false)
     }
   }
@@ -238,6 +260,9 @@ export default function OutlookListPage() {
         <Space size={8}>
           <Button icon={<ReloadOutlined />} onClick={() => void load()} loading={loading}>刷新</Button>
           <Button loading={checkLoading} onClick={() => void handleCheckHealth()}>检测异常邮箱</Button>
+          {checkProgressRunning && !checkProgressOpen ? (
+            <Button onClick={() => setCheckProgressOpen(true)}>重新打开进度</Button>
+          ) : null}
           <Button onClick={() => void handleExport()}>导出</Button>
           <Button type="primary" icon={<UploadOutlined />} onClick={() => navigate('/mailpool/outlook/import')}>导入邮箱</Button>
         </Space>
