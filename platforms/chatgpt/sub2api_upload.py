@@ -221,7 +221,7 @@ def upload_to_sub2api(
             remote_names = _fetch_remote_names(
                 api_url=api_url,
                 api_key=api_key,
-                timeout=timeout,
+                timeout=30,
             )
             if email_name in remote_names:
                 return True, "远端已存在，跳过上传"
