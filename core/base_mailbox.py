@@ -3303,27 +3303,21 @@ class OutlookMailbox(BaseMailbox):
         client_id = str(extra.get("client_id") or "").strip()
         refresh_token = str(extra.get("refresh_token") or "").strip()
 
-        if client_id and refresh_token:
-            try:
-                access_token = self._fetch_graph_access_token(
-                    email=email,
-                    client_id=client_id,
-                    refresh_token=refresh_token,
-                )
-                if access_token:
-                    return True, "graph_ok"
-            except Exception as exc:
-                return False, f"graph_error: {exc}"
+        if not client_id or not refresh_token:
+            return False, "graph_error: missing_client_id_or_refresh_token"
 
         try:
-            imap_conn = self._open_imap(account)
-            try:
-                imap_conn.logout()
-            except Exception:
-                pass
-            return True, "imap_ok"
+            access_token = self._fetch_graph_access_token(
+                email=email,
+                client_id=client_id,
+                refresh_token=refresh_token,
+            )
+            if not access_token:
+                return False, "graph_error: unable_to_refresh_access_token"
+            messages = self._graph_list_messages(account)
+            return True, f"graph_ok_messages={len(messages)}"
         except Exception as exc:
-            return False, f"imap_error: {exc}"
+            return False, f"graph_error: {exc}"
 
     def get_email(self) -> MailboxAccount:
         logged_waiting = False
@@ -3331,21 +3325,11 @@ class OutlookMailbox(BaseMailbox):
             self._checkpoint()
             payload = self._try_claim_account()
             if payload:
-                valid, reason = self._validate_claimed_account(payload)
-                if valid:
-                    self._finalize_claimed_account(
-                        str(payload.get("id") or ""),
-                        keep_disabled=False,
-                    )
-                    break
-                self._log(
-                    f"[Outlook] 跳过异常邮箱: {str(payload.get('email') or '').strip()} ({reason})"
-                )
                 self._finalize_claimed_account(
                     str(payload.get("id") or ""),
-                    keep_disabled=True,
+                    keep_disabled=False,
                 )
-                continue
+                break
             if not logged_waiting:
                 if self._source_tag_filter:
                     self._log(
