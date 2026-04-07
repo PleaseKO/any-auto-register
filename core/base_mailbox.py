@@ -3200,6 +3200,26 @@ class OutlookMailbox(BaseMailbox):
         self._source_tag_filter = str(source_tag_filter or "").strip().lower()
         self._graph_api_base = "https://graph.microsoft.com/v1.0"
         self._account_wait_poll_interval = 5.0
+        self._graph_mail_folders = (
+            "inbox",
+            "junkemail",
+            "archive",
+            "drafts",
+            "sentitems",
+            "deleteditems",
+        )
+        self._imap_mail_folders = (
+            "INBOX",
+            "Junk",
+            '"Junk Email"',
+            "Spam",
+            '"Spam"',
+            "垃圾邮件",
+            "Archive",
+            '"All Mail"',
+            '"Deleted Items"',
+            "Deleted Items",
+        )
 
     def _try_pop_account(self) -> Optional[dict]:
         from sqlmodel import Session, select
@@ -3413,7 +3433,8 @@ class OutlookMailbox(BaseMailbox):
         }
         collected: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        for folder_name in ("inbox", "junkemail"):
+        folder_errors: list[str] = []
+        for folder_name in self._graph_mail_folders:
             url = f"{self._graph_api_base}/me/mailFolders/{folder_name}/messages"
             resp = requests.get(
                 url,
@@ -3423,9 +3444,10 @@ class OutlookMailbox(BaseMailbox):
                 proxies=self._proxy,
             )
             if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Graph 拉取邮件失败({folder_name}): HTTP {resp.status_code} {resp.text[:160]}"
+                folder_errors.append(
+                    f"{folder_name}:HTTP {resp.status_code} {resp.text[:80]}"
                 )
+                continue
             payload = resp.json() if resp.content else {}
             items = payload.get("value") if isinstance(payload, dict) else []
             if not isinstance(items, list):
@@ -3439,6 +3461,10 @@ class OutlookMailbox(BaseMailbox):
                 if message_id:
                     seen_ids.add(message_id)
                 collected.append(item)
+        if not collected and folder_errors:
+            raise RuntimeError(
+                "Graph 拉取邮件失败: " + "; ".join(folder_errors[:3])
+            )
         return collected
 
     def _extract_graph_message_text(self, message: dict[str, Any]) -> str:
@@ -3567,7 +3593,7 @@ class OutlookMailbox(BaseMailbox):
         try:
             imap_conn = self._open_imap(account)
             collected_ids: set[str] = set()
-            for folder in ("INBOX", "Junk", '"Junk Email"', "垃圾邮件"):
+            for folder in self._imap_mail_folders:
                 try:
                     status, _ = imap_conn.select(folder, readonly=True)
                 except Exception:
@@ -3636,7 +3662,7 @@ class OutlookMailbox(BaseMailbox):
             imap_conn = None
             try:
                 imap_conn = self._open_imap(account)
-                for folder in ("INBOX", "Junk", '"Junk Email"', "垃圾邮件"):
+                for folder in self._imap_mail_folders:
                     try:
                         status, _ = imap_conn.select(folder, readonly=True)
                     except Exception:

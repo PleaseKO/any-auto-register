@@ -261,6 +261,54 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertNotIn("Origin", headers)
         self.assertNotIn("oai-device-id", headers)
 
+    def test_submit_about_you_create_account_prefers_browser_tokens_and_so_token(self):
+        client = self._make_client()
+        response = mock.Mock()
+        response.status_code = 200
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        response.text = ""
+        response.json.return_value = {
+            "continue_url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        next_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_tokens_via_browser",
+            return_value={
+                "token": '{"browser":"token"}',
+                "session_observer_token": "so-token-123",
+            },
+        ) as browser_tokens, mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token"
+        ) as build_token, mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=next_state,
+        ):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(state, next_state)
+        browser_tokens.assert_called_once()
+        build_token.assert_not_called()
+        headers = client.session.post.call_args.kwargs["headers"]
+        self.assertEqual(headers["openai-sentinel-token"], '{"browser":"token"}')
+        self.assertEqual(headers["sentinel-so-token"], "so-token-123")
+
     def test_login_and_get_tokens_prefers_passwordless_over_password_verify(self):
         client = self._make_client()
         login_password_state = FlowState(

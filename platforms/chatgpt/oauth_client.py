@@ -29,7 +29,10 @@ from .utils import (
     seed_oai_device_cookie,
 )
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import (
+    get_sentinel_token_via_browser,
+    get_sentinel_tokens_via_browser,
+)
 
 
 class OAuthClient:
@@ -1525,12 +1528,38 @@ class OAuthClient:
         }
         self._log("about_you 请求体已构建，准备 POST /api/accounts/create_account")
 
-        def _build_create_headers(sentinel_token: str = ""):
+        browser_tokens = get_sentinel_tokens_via_browser(
+            flow="oauth_create_account",
+            proxy=self.proxy,
+            page_url=referer or about_you_url,
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
+        )
+        initial_sentinel_token = str(browser_tokens.get("token") or "").strip()
+        initial_so_token = str(browser_tokens.get("session_observer_token") or "").strip()
+        if initial_sentinel_token:
+            self._log(
+                "oauth_create_account: 已通过 Playwright SentinelSDK 获取 token "
+                f"(so_token={'✓' if initial_so_token else '✗'})"
+            )
+        else:
+            self._log(
+                "oauth_create_account: 浏览器 token 获取失败，首次请求将降级不带 sentinel "
+                f"(so_token={'✓' if initial_so_token else '✗'})"
+            )
+
+        def _build_create_headers(
+            sentinel_token: str = "",
+            session_observer_token: str = "",
+        ):
             extra_headers = {
                 "oai-device-id": device_id,
             }
             if sentinel_token:
                 extra_headers["openai-sentinel-token"] = sentinel_token
+            if session_observer_token:
+                extra_headers["sentinel-so-token"] = session_observer_token
             headers_local = self._headers(
                 request_url,
                 user_agent=user_agent,
@@ -1545,10 +1574,16 @@ class OAuthClient:
             headers_local.update(generate_datadog_trace())
             return headers_local
 
-        def _post_create(sentinel_token: str = ""):
+        def _post_create(
+            sentinel_token: str = "",
+            session_observer_token: str = "",
+        ):
             kwargs = {
                 "json": payload,
-                "headers": _build_create_headers(sentinel_token),
+                "headers": _build_create_headers(
+                    sentinel_token,
+                    session_observer_token,
+                ),
                 "timeout": 30,
                 "allow_redirects": False,
             }
@@ -1558,7 +1593,7 @@ class OAuthClient:
             return self.session.post(request_url, **kwargs)
 
         try:
-            r = _post_create()
+            r = _post_create(initial_sentinel_token, initial_so_token)
             self._log(f"/create_account -> {r.status_code}")
             self._log(
                 "about_you 响应: "
@@ -1571,19 +1606,42 @@ class OAuthClient:
                 or "challenge" in (r.text or "").lower()
             ):
                 self._log("create_account 首次请求需要额外挑战，补发 sentinel 后重试...")
-                sentinel_token = build_sentinel_token(
-                    self.session,
-                    device_id,
-                    flow="oauth_create_account",
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
+                sentinel_token = initial_sentinel_token
+                session_observer_token = initial_so_token
+                if not sentinel_token:
+                    browser_tokens = get_sentinel_tokens_via_browser(
+                        flow="oauth_create_account",
+                        proxy=self.proxy,
+                        page_url=referer or about_you_url,
+                        headless=self.browser_mode != "headed",
+                        device_id=device_id,
+                        log_fn=lambda msg: self._log(f"oauth_create_account(retry): {msg}"),
+                    )
+                    sentinel_token = str(browser_tokens.get("token") or "").strip()
+                    session_observer_token = str(
+                        browser_tokens.get("session_observer_token") or ""
+                    ).strip()
+                    if sentinel_token:
+                        self._log(
+                            "oauth_create_account(retry): 浏览器补发 token 成功 "
+                            f"(so_token={'✓' if session_observer_token else '✗'})"
+                        )
+                if not sentinel_token:
+                    sentinel_token = build_sentinel_token(
+                        self.session,
+                        device_id,
+                        flow="oauth_create_account",
+                        user_agent=user_agent,
+                        sec_ch_ua=sec_ch_ua,
+                        impersonate=impersonate,
+                    )
+                    if sentinel_token:
+                        self._log("oauth_create_account(retry): 已回退到 HTTP PoW token")
                 if not sentinel_token:
                     self._set_error("无法获取 sentinel token (oauth_create_account)")
                     return None
 
-                r = _post_create(sentinel_token)
+                r = _post_create(sentinel_token, session_observer_token)
                 self._log(f"/create_account(重试) -> {r.status_code}")
                 self._log(
                     "about_you 重试响应: "
@@ -3285,4 +3343,3 @@ class OAuthClient:
                 f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
             )
         return None
-

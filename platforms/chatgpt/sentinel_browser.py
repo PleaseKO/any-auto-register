@@ -24,7 +24,7 @@ def _flow_page_url(flow: str) -> str:
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
 
 
-def get_sentinel_token_via_browser(
+def get_sentinel_tokens_via_browser(
     *,
     flow: str,
     proxy: Optional[str] = None,
@@ -33,15 +33,15 @@ def get_sentinel_token_via_browser(
     headless: bool = True,
     device_id: Optional[str] = None,
     log_fn: Optional[Callable[[str], None]] = None,
-) -> Optional[str]:
-    """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
+) -> dict[str, str]:
+    """通过浏览器直接调用 SentinelSDK，返回 flow token 和可选的 session observer token。"""
     logger = log_fn or (lambda _msg: None)
 
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         logger(f"Sentinel Browser 不可用: {e}")
-        return None
+        return {}
 
     target_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
     effective_headless, reason = resolve_browser_headless(headless)
@@ -102,14 +102,30 @@ def get_sentinel_token_via_browser(
             result = page.evaluate(
                 """
                 async ({ flow }) => {
+                    const response = { success: false, token: '', sessionObserverToken: '', error: '' };
                     try {
+                        if (!window.SentinelSDK || typeof window.SentinelSDK.token !== 'function') {
+                            response.error = 'SentinelSDK.token missing';
+                            return response;
+                        }
+                        if (typeof window.SentinelSDK.init === 'function') {
+                            await window.SentinelSDK.init(flow);
+                        }
                         const token = await window.SentinelSDK.token(flow);
-                        return { success: true, token };
+                        response.token = String(token || '');
+                        if (typeof window.SentinelSDK.sessionObserverToken === 'function') {
+                            try {
+                                const soToken = await window.SentinelSDK.sessionObserverToken(flow);
+                                response.sessionObserverToken = String(soToken || '');
+                            } catch (err) {
+                                response.sessionObserverError = (err && (err.message || String(err))) || 'unknown';
+                            }
+                        }
+                        response.success = !!response.token;
+                        return response;
                     } catch (e) {
-                        return {
-                            success: false,
-                            error: (e && (e.message || String(e))) || "unknown",
-                        };
+                        response.error = (e && (e.message || String(e))) || 'unknown';
+                        return response;
                     }
                 }
                 """,
@@ -121,12 +137,13 @@ def get_sentinel_token_via_browser(
                     "Sentinel Browser 获取失败: "
                     + str((result or {}).get("error") or "no result")
                 )
-                return None
+                return {}
 
-            token = str(result["token"] or "").strip()
+            token = str(result.get("token") or "").strip()
+            so_token = str(result.get("sessionObserverToken") or "").strip()
             if not token:
                 logger("Sentinel Browser 返回空 token")
-                return None
+                return {}
 
             try:
                 parsed = json.loads(token)
@@ -134,14 +151,45 @@ def get_sentinel_token_via_browser(
                     "Sentinel Browser 成功: "
                     f"p={'✓' if parsed.get('p') else '✗'} "
                     f"t={'✓' if parsed.get('t') else '✗'} "
-                    f"c={'✓' if parsed.get('c') else '✗'}"
+                    f"c={'✓' if parsed.get('c') else '✗'} "
+                    f"so={'✓' if so_token else '✗'}"
                 )
             except Exception:
-                logger(f"Sentinel Browser 成功: len={len(token)}")
+                logger(
+                    f"Sentinel Browser 成功: len={len(token)} "
+                    f"so={'✓' if so_token else '✗'}"
+                )
 
-            return token
+            payload = {"token": token}
+            if so_token:
+                payload["session_observer_token"] = so_token
+            return payload
         except Exception as e:
             logger(f"Sentinel Browser 异常: {e}")
-            return None
+            return {}
         finally:
             browser.close()
+
+
+def get_sentinel_token_via_browser(
+    *,
+    flow: str,
+    proxy: Optional[str] = None,
+    timeout_ms: int = 45000,
+    page_url: Optional[str] = None,
+    headless: bool = True,
+    device_id: Optional[str] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
+    result = get_sentinel_tokens_via_browser(
+        flow=flow,
+        proxy=proxy,
+        timeout_ms=timeout_ms,
+        page_url=page_url,
+        headless=headless,
+        device_id=device_id,
+        log_fn=log_fn,
+    )
+    token = str(result.get("token") or "").strip()
+    return token or None
