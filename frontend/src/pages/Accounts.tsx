@@ -45,6 +45,7 @@ import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
 const REGISTER_TASK_STORAGE_KEY = 'accounts_register_task_snapshot'
+const SUB2API_BACKFILL_TASK_STORAGE_KEY = 'accounts_sub2api_backfill_task_snapshot'
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
@@ -636,8 +637,68 @@ export default function Accounts() {
     return allItems
   }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd])
 
+  const trackSub2apiTask = useCallback(async (taskId: string) => {
+    let timer: number | undefined
+    const poll = async () => {
+      let snapshot: any
+      try {
+        snapshot = await apiFetch(`/tasks/${taskId}`) as any
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : ''
+        if (detail.includes('404') || detail.includes('不存在')) {
+          localStorage.removeItem(SUB2API_BACKFILL_TASK_STORAGE_KEY)
+          setSub2apiProgressRunning(false)
+          setSub2apiProgressOpen(false)
+          message.warning('Sub2API 补传任务已失效或已结束')
+          return
+        }
+        throw error
+      }
+      const progress = String(snapshot.progress || '0/0').split('/')
+      const current = Number(progress[0] || 0)
+      const total = Number(progress[1] || snapshot.total || 0)
+      const logs = Array.isArray(snapshot.logs) ? snapshot.logs : []
+      const lastLine = logs.length > 0 ? String(logs[logs.length - 1] || '') : ''
+      setSub2apiProgress({
+        total,
+        current,
+        currentEmail: lastLine.replace(/^\[[^\]]+\]\s*/, ''),
+      })
+      if (['done', 'failed', 'stopped'].includes(String(snapshot.status || ''))) {
+        localStorage.removeItem(SUB2API_BACKFILL_TASK_STORAGE_KEY)
+        setSub2apiProgressRunning(false)
+        await load()
+        return
+      }
+      timer = window.setTimeout(poll, 1000)
+    }
+    await poll()
+    return () => {
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [load])
+
   useEffect(() => {
     load()
+  }, [load])
+
+  useEffect(() => {
+    const raw = localStorage.getItem(SUB2API_BACKFILL_TASK_STORAGE_KEY)
+    if (!raw) return
+    let timer: number | undefined
+    try {
+      const parsed = JSON.parse(raw || '{}')
+      const taskId = String(parsed.taskId || '').trim()
+      if (!taskId) return
+      setSub2apiProgressOpen(true)
+      setSub2apiProgressRunning(true)
+      void trackSub2apiTask(taskId)
+    } catch {
+      localStorage.removeItem(SUB2API_BACKFILL_TASK_STORAGE_KEY)
+    }
+    return () => {
+      if (timer) window.clearTimeout(timer)
+    }
   }, [load])
 
   useEffect(() => {
@@ -1082,56 +1143,17 @@ export default function Accounts() {
           return
         }
 
+        const res = await apiFetch('/integrations/backfill/start', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+        const taskId = String(res.task_id || '').trim()
+        if (!taskId) throw new Error('未获取到补传任务 ID')
+        localStorage.setItem(SUB2API_BACKFILL_TASK_STORAGE_KEY, JSON.stringify({ taskId }))
         setSub2apiProgress({ total: targetAccounts.length, current: 0, currentEmail: '' })
         setSub2apiProgressRunning(true)
         setSub2apiProgressOpen(true)
-
-        let success = 0
-        let failed = 0
-        let skipped = 0
-        const items: any[] = []
-
-        for (let index = 0; index < targetAccounts.length; index += 1) {
-          const account = targetAccounts[index]
-          setSub2apiProgress({
-            total: targetAccounts.length,
-            current: index,
-            currentEmail: String(account.email || ''),
-          })
-          const result = await apiFetch('/integrations/backfill', {
-            method: 'POST',
-            body: JSON.stringify({
-              platforms: ['chatgpt'],
-              target: 'sub2api',
-              account_ids: [Number(account.id)],
-            }),
-          })
-          success += Number(result.success || 0)
-          failed += Number(result.failed || 0)
-          skipped += Number(result.skipped || 0)
-          items.push(...(result.items || []))
-          setSub2apiProgress({
-            total: targetAccounts.length,
-            current: index + 1,
-            currentEmail: String(account.email || ''),
-          })
-        }
-
-        const actionLabel = mode === 'selected' ? '所选账号 Sub2API 补传' : 'Sub2API 未上传账号补传'
-        const result = { total: targetAccounts.length, success, failed, skipped, items }
-        if (!result.total) {
-          message.info('没有可处理的账号')
-        } else if (!result.failed && !result.skipped) {
-          message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
-        } else if (!result.failed) {
-          message.success(`${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-        } else if (!result.success) {
-          message.error(`${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-        } else {
-          message.warning(`${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-        }
-        showCpaSyncResult(`${actionLabel}结果`, result)
-        await load()
+        void trackSub2apiTask(taskId)
         return
       }
 
@@ -1162,7 +1184,6 @@ export default function Accounts() {
     } catch (e: any) {
       message.error(`${target === 'sub2api' ? 'Sub2API' : '补传'}失败: ${e.message}`)
     } finally {
-      setSub2apiProgressRunning(false)
       setIntegrationSyncLoading('')
     }
   }

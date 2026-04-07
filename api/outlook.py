@@ -2,8 +2,9 @@ from datetime import datetime, timezone
 import json
 import io
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, BackgroundTasks, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select, func
@@ -65,6 +66,46 @@ class OutlookUpdateRequest(BaseModel):
     password: Optional[str] = None
     client_id: Optional[str] = None
     refresh_token: Optional[str] = None
+
+
+def _create_async_task(*, platform: str, total: int, source: str, meta: dict[str, Any] | None = None) -> str:
+    from api.tasks import _task_store
+    import time
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    _task_store.create(task_id, platform=platform, total=total, source=source, meta=meta or {})
+    return task_id
+
+
+def _task_log(task_id: str, message: str) -> None:
+    from api.tasks import _task_store
+    import time
+
+    entry = f"[{time.strftime('%H:%M:%S')}] {message}"
+    _task_store.append_log(task_id, entry)
+
+
+def _finish_async_task(task_id: str, *, success: int, skipped: int, errors: list[str], status: str = "done") -> None:
+    from api.tasks import _task_store
+
+    _task_store.finish(task_id, status=status, success=success, skipped=skipped, errors=errors)
+    _task_store.cleanup()
+
+
+def _retry_validate_outlook_account(mailbox, payload: dict, *, retries: int = 3) -> tuple[bool, str]:
+    import time
+
+    last_valid = False
+    last_reason = "unknown"
+    for attempt in range(1, retries + 1):
+        valid, reason = mailbox._validate_claimed_account(payload)  # type: ignore[attr-defined]
+        last_valid = bool(valid)
+        last_reason = str(reason or "")
+        if last_valid:
+            return True, last_reason
+        if attempt < retries:
+            time.sleep(min(2 * attempt, 5))
+    return last_valid, last_reason
 
 
 def _dedupe_outlook_rows(
@@ -553,6 +594,136 @@ def check_outlook_accounts_health(request: OutlookHealthCheckRequest):
         "disabled": disabled,
         "items": results,
     }
+
+
+def _run_outlook_health_check_task(task_id: str, request: OutlookHealthCheckRequest) -> None:
+    from core.base_mailbox import create_mailbox
+    from api.tasks import _task_store
+
+    _task_store.mark_running(task_id)
+    ids = [int(x) for x in (request.ids or []) if int(x) > 0]
+    q = str(request.q or "").strip()
+    enabled_raw = str(request.enabled or "").strip().lower()
+    source_tag_raw = str(request.source_tag or "").strip().lower()
+    disable_invalid = bool(request.disable_invalid)
+    limit = min(max(int(request.limit or 200), 1), 1000)
+
+    query = select(OutlookAccountModel)
+    if ids:
+        query = query.where(OutlookAccountModel.id.in_(ids))
+    if q:
+        query = query.where(OutlookAccountModel.email.ilike(f"%{q}%"))
+    if enabled_raw in {"true", "1", "yes"}:
+        query = query.where(OutlookAccountModel.enabled == True)  # noqa: E712
+    elif enabled_raw in {"false", "0", "no"}:
+        query = query.where(OutlookAccountModel.enabled == False)  # noqa: E712
+    if source_tag_raw:
+        query = query.where(OutlookAccountModel.source_tag == source_tag_raw)
+
+    mailbox = create_mailbox(provider="outlook", extra={}, proxy=None)
+    success = 0
+    skipped = 0
+    errors: list[str] = []
+
+    with Session(engine) as session:
+        rows = session.exec(query.order_by(OutlookAccountModel.id.asc()).limit(limit)).all()
+        total = len(rows)
+        _task_store.set_progress(task_id, f"0/{total}")
+
+        task_rows = [
+            {
+                "id": int(row.id or 0),
+                "email": str(row.email or "").strip(),
+                "password": row.password,
+                "client_id": row.client_id,
+                "refresh_token": row.refresh_token,
+                "source_tag": row.source_tag,
+                "enabled": bool(row.enabled),
+            }
+            for row in rows
+        ]
+
+    def _worker(payload: dict[str, Any]) -> dict[str, Any]:
+        local_mailbox = create_mailbox(provider="outlook", extra={}, proxy=None)
+        valid, reason = _retry_validate_outlook_account(local_mailbox, payload, retries=3)
+        return {
+            "id": int(payload.get("id") or 0),
+            "email": str(payload.get("email") or "").strip(),
+            "valid": bool(valid),
+            "reason": str(reason or ""),
+            "enabled": bool(payload.get("enabled")),
+        }
+
+    completed = 0
+    max_workers = min(10, max(1, len(task_rows)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(_worker, payload): payload for payload in task_rows}
+        for future in as_completed(future_map):
+            payload = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "id": int(payload.get("id") or 0),
+                    "email": str(payload.get("email") or "").strip(),
+                    "valid": False,
+                    "reason": str(exc),
+                    "enabled": bool(payload.get("enabled")),
+                }
+
+            email = str(result.get("email") or "").strip()
+            valid = bool(result.get("valid"))
+            reason = str(result.get("reason") or "")
+            if valid:
+                success += 1
+                _task_log(task_id, f"[OK] {email} 可用 ({reason})")
+            else:
+                errors.append(f"{email}: {reason}")
+                _task_log(task_id, f"[FAIL] {email} 异常 ({reason})")
+                if disable_invalid and bool(result.get("enabled")):
+                    with Session(engine) as session:
+                        db_row = session.get(OutlookAccountModel, int(result.get("id") or 0))
+                        if db_row and db_row.enabled:
+                            db_row.enabled = False
+                            db_row.updated_at = _utcnow()
+                            session.add(db_row)
+                            session.commit()
+                            skipped += 1
+                            _task_log(task_id, f"[SKIP] 已禁用异常邮箱: {email}")
+            completed += 1
+            _task_store.set_progress(task_id, f"{completed}/{total}")
+
+    _finish_async_task(task_id, success=success, skipped=skipped, errors=errors)
+
+
+@router.post("/check-health/start")
+def start_outlook_health_check_task(request: OutlookHealthCheckRequest, background_tasks: BackgroundTasks):
+    with Session(engine) as session:
+        query = select(func.count()).select_from(OutlookAccountModel)
+        ids = [int(x) for x in (request.ids or []) if int(x) > 0]
+        q = str(request.q or "").strip()
+        enabled_raw = str(request.enabled or "").strip().lower()
+        source_tag_raw = str(request.source_tag or "").strip().lower()
+        if ids:
+            query = query.where(OutlookAccountModel.id.in_(ids))
+        if q:
+            query = query.where(OutlookAccountModel.email.ilike(f"%{q}%"))
+        if enabled_raw in {"true", "1", "yes"}:
+            query = query.where(OutlookAccountModel.enabled == True)  # noqa: E712
+        elif enabled_raw in {"false", "0", "no"}:
+            query = query.where(OutlookAccountModel.enabled == False)  # noqa: E712
+        if source_tag_raw:
+            query = query.where(OutlookAccountModel.source_tag == source_tag_raw)
+        total = int(session.exec(query).one() or 0)
+
+    task_id = _create_async_task(
+        platform="outlook_health_check",
+        total=total,
+        source="manual_outlook_health_check",
+        meta={"request": request.model_dump()},
+    )
+    background_tasks.add_task(_run_outlook_health_check_task, task_id, request)
+    return {"task_id": task_id}
 
 
 @router.post("/batch-delete")

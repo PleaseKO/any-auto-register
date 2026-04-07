@@ -5,6 +5,8 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate } from 'react-router-dom'
 import { apiFetch } from '@/lib/utils'
 
+const OUTLOOK_CHECK_TASK_STORAGE_KEY = 'outlook_health_check_task_snapshot'
+
 type OutlookAccount = {
   id: number
   email: string
@@ -43,6 +45,47 @@ export default function OutlookListPage() {
   const [checkProgressOpen, setCheckProgressOpen] = useState(false)
   const [checkProgressRunning, setCheckProgressRunning] = useState(false)
   const [checkProgress, setCheckProgress] = useState({ total: 0, current: 0, currentEmail: '' })
+
+  const trackCheckTask = async (taskId: string) => {
+    let timer: number | undefined
+    const poll = async () => {
+      let snapshot: any
+      try {
+        snapshot = await apiFetch(`/tasks/${taskId}`) as any
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : ''
+        if (detail.includes('404') || detail.includes('不存在')) {
+          localStorage.removeItem(OUTLOOK_CHECK_TASK_STORAGE_KEY)
+          setCheckProgressRunning(false)
+          setCheckProgressOpen(false)
+          message.warning('邮箱检测任务已失效或已结束')
+          return
+        }
+        throw error
+      }
+      const progress = String(snapshot.progress || '0/0').split('/')
+      const current = Number(progress[0] || 0)
+      const total = Number(progress[1] || snapshot.total || 0)
+      const logs = Array.isArray(snapshot.logs) ? snapshot.logs : []
+      const lastLine = logs.length > 0 ? String(logs[logs.length - 1] || '') : ''
+      setCheckProgress({
+        total,
+        current,
+        currentEmail: lastLine.replace(/^\[[^\]]+\]\s*/, ''),
+      })
+      if (['done', 'failed', 'stopped'].includes(String(snapshot.status || ''))) {
+        localStorage.removeItem(OUTLOOK_CHECK_TASK_STORAGE_KEY)
+        setCheckProgressRunning(false)
+        await load()
+        return
+      }
+      timer = window.setTimeout(poll, 1000)
+    }
+    await poll()
+    return () => {
+      if (timer) window.clearTimeout(timer)
+    }
+  }
 
   const fetchAllOutlookItems = async (): Promise<OutlookAccount[]> => {
     const allItems: OutlookAccount[] = []
@@ -87,6 +130,25 @@ export default function OutlookListPage() {
   useEffect(() => {
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const raw = localStorage.getItem(OUTLOOK_CHECK_TASK_STORAGE_KEY)
+    if (!raw) return
+    let timer: number | undefined
+    try {
+      const parsed = JSON.parse(raw || '{}')
+      const taskId = String(parsed.taskId || '').trim()
+      if (!taskId) return
+      setCheckProgressOpen(true)
+      setCheckProgressRunning(true)
+      void trackCheckTask(taskId)
+    } catch {
+      localStorage.removeItem(OUTLOOK_CHECK_TASK_STORAGE_KEY)
+    }
+    return () => {
+      if (timer) window.clearTimeout(timer)
+    }
   }, [])
 
   const handleToggle = async (row: OutlookAccount) => {
@@ -143,79 +205,26 @@ export default function OutlookListPage() {
         return
       }
 
-      setCheckProgress({ total: items.length, current: 0, currentEmail: '' })
+      const res = await apiFetch('/outlook/check-health/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          q,
+          enabled: enabled || '',
+          source_tag: sourceTag,
+          disable_invalid: true,
+          limit: 1000,
+        }),
+      })
+      const taskId = String(res.task_id || '').trim()
+      if (!taskId) throw new Error('未获取到检测任务 ID')
+      localStorage.setItem(OUTLOOK_CHECK_TASK_STORAGE_KEY, JSON.stringify({ taskId }))
       setCheckProgressRunning(true)
       setCheckProgressOpen(true)
-
-      let checked = 0
-      let healthy = 0
-      let invalid = 0
-      let disabled = 0
-      const invalidItems: Array<{ email: string; reason: string }> = []
-
-      for (const item of items) {
-        setCheckProgress({ total: items.length, current: checked, currentEmail: item.email })
-        const result = await apiFetch('/outlook/check-health', {
-          method: 'POST',
-          body: JSON.stringify({
-            ids: [item.id],
-            disable_invalid: true,
-            limit: 1,
-          }),
-        })
-        checked += Number(result.checked || 0)
-        healthy += Number(result.healthy || 0)
-        invalid += Number(result.invalid || 0)
-        disabled += Number(result.disabled || 0)
-        const failedRows = (result.items || []).filter((row: any) => !row.valid)
-        invalidItems.push(
-          ...failedRows.map((row: any) => ({
-            email: String(row.email || ''),
-            reason: String(row.reason || 'unknown'),
-          })),
-        )
-        setCheckProgress({ total: items.length, current: checked, currentEmail: item.email })
-      }
-
-      const result = { checked, healthy, invalid, disabled, items: invalidItems }
-      if (!result.checked) {
-        message.info('当前没有可检测的 Outlook 邮箱')
-      } else if (!result.invalid) {
-        message.success(`检测完成：正常 ${result.healthy} / ${result.checked}`)
-      } else {
-        message.warning(`检测完成：异常 ${result.invalid}，已禁用 ${result.disabled} / ${result.checked}`)
-      }
-
-      if (invalidItems.length > 0) {
-        Modal.info({
-          title: '异常邮箱检测结果',
-          width: 760,
-          content: (
-            <pre
-              style={{
-                margin: 0,
-                maxHeight: 360,
-                overflow: 'auto',
-                padding: 12,
-                borderRadius: 8,
-                background: 'rgba(127,127,127,0.08)',
-                fontSize: 12,
-                lineHeight: 1.5,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-              }}
-            >
-              {invalidItems.map((item) => `${item.email} | ${item.reason || 'unknown'}`).join('\n')}
-            </pre>
-          ),
-        })
-      }
-      await load()
+      void trackCheckTask(taskId)
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : '批量检测失败'
       message.error(msg || '批量检测失败')
     } finally {
-      setCheckProgressRunning(false)
       setCheckLoading(false)
     }
   }

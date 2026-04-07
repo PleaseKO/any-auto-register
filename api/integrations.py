@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel, Field
-from sqlmodel import Session, select
+from sqlmodel import Session, select, func
 
 from core.base_platform import Account, AccountStatus
 from core.db import AccountModel, engine
@@ -26,6 +27,46 @@ class BackfillRequest(BaseModel):
     status: Optional[str] = None
     email: Optional[str] = None
     target: str = "cliproxyapi"
+
+
+def _create_async_task(*, platform: str, total: int, source: str, meta: dict | None = None) -> str:
+    from api.tasks import _task_store
+    import time
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    _task_store.create(task_id, platform=platform, total=total, source=source, meta=meta or {})
+    return task_id
+
+
+def _task_log(task_id: str, message: str) -> None:
+    from api.tasks import _task_store
+    import time
+
+    _task_store.append_log(task_id, f"[{time.strftime('%H:%M:%S')}] {message}")
+
+
+def _finish_async_task(task_id: str, *, success: int, skipped: int, errors: list[str], status: str = "done") -> None:
+    from api.tasks import _task_store
+
+    _task_store.finish(task_id, status=status, success=success, skipped=skipped, errors=errors)
+    _task_store.cleanup()
+
+
+def _retry_chatgpt_backfill(row: AccountModel, *, target: str, session: Session, retries: int = 3) -> dict:
+    import time
+
+    last_outcome: dict = {"ok": False, "message": "unknown", "results": []}
+    for attempt in range(1, retries + 1):
+        last_outcome = (
+            backfill_chatgpt_account_to_sub2api(row, session=session, commit=True)
+            if target == "sub2api"
+            else backfill_chatgpt_account_to_cpa(row, session=session, commit=True)
+        )
+        if bool(last_outcome.get("ok")) or bool(last_outcome.get("skipped")):
+            return last_outcome
+        if attempt < retries:
+            time.sleep(min(2 * attempt, 5))
+    return last_outcome
 
 
 def _to_account(model: AccountModel) -> Account:
@@ -182,3 +223,152 @@ def backfill_integrations(body: BackfillRequest):
             summary["total"] += 1
 
     return summary
+
+
+def _run_backfill_integrations_task(task_id: str, body: BackfillRequest) -> None:
+    from api.tasks import _task_store
+
+    _task_store.mark_running(task_id)
+    summary = {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+    targets = set(body.platforms or [])
+    target = str(body.target or "cliproxyapi").strip().lower() or "cliproxyapi"
+    errors: list[str] = []
+
+    with Session(engine) as s:
+        q = select(AccountModel)
+        if body.account_ids:
+            q = q.where(AccountModel.id.in_(body.account_ids))
+            if targets:
+                q = q.where(AccountModel.platform.in_(targets))
+        elif targets:
+            q = q.where(AccountModel.platform.in_(targets))
+        else:
+            _finish_async_task(task_id, success=0, skipped=0, errors=[], status="done")
+            return
+
+        if body.status:
+            q = q.where(AccountModel.status == body.status)
+        if body.email:
+            q = q.where(AccountModel.email.contains(body.email))
+
+        rows = s.exec(q).all()
+        if body.pending_only:
+            rows = [
+                row for row in rows
+                if row.platform != "chatgpt"
+                or (
+                    str(get_cliproxy_sync_state(row).get("remote_state") or "").strip().lower() == "not_found"
+                    if target == "cliproxyapi"
+                    else not bool(get_sub2api_sync_state(row).get("uploaded") or get_sub2api_sync_state(row).get("uploaded_at"))
+                )
+            ]
+
+        total = len(rows)
+        _task_store.set_progress(task_id, f"0/{total}")
+
+        if target == "sub2api":
+            task_rows = [(int(row.id or 0), str(row.email or "").strip(), str(row.platform or "").strip()) for row in rows]
+
+            def _worker(account_id: int, email: str, platform: str) -> dict:
+                if platform != "chatgpt":
+                    return {"email": email, "status": "skipped", "message": "非 chatgpt 账号"}
+                with Session(engine) as thread_session:
+                    db_row = thread_session.get(AccountModel, account_id)
+                    if not db_row:
+                        return {"email": email, "status": "failed", "message": "账号不存在"}
+                    outcome = _retry_chatgpt_backfill(db_row, target=target, session=thread_session, retries=3)
+                    ok = bool(outcome.get("ok"))
+                    skipped = bool(outcome.get("skipped"))
+                    msg = str(outcome.get("message") or "")
+                    if skipped:
+                        return {"email": email, "status": "skipped", "message": msg}
+                    if ok:
+                        return {"email": email, "status": "success", "message": msg}
+                    return {"email": email, "status": "failed", "message": msg}
+
+            completed = 0
+            max_workers = min(10, max(1, len(task_rows)))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_map = {
+                    pool.submit(_worker, account_id, email, platform): (account_id, email)
+                    for account_id, email, platform in task_rows
+                }
+                for future in as_completed(future_map):
+                    account_id, email = future_map[future]
+                    try:
+                        result = future.result()
+                        status = str(result.get("status") or "failed")
+                        msg = str(result.get("message") or "")
+                    except Exception as exc:
+                        status = "failed"
+                        msg = str(exc)
+                    if status == "success":
+                        summary["success"] += 1
+                        _task_log(task_id, f"[OK] {email} {msg}")
+                    elif status == "skipped":
+                        summary["skipped"] += 1
+                        _task_log(task_id, f"[SKIP] {email} {msg}")
+                    else:
+                        summary["failed"] += 1
+                        errors.append(f"{email}: {msg}")
+                        _task_log(task_id, f"[FAIL] {email} {msg}")
+                    completed += 1
+                    summary["total"] += 1
+                    _task_store.set_progress(task_id, f"{completed}/{total}")
+        else:
+            for index, row in enumerate(rows, start=1):
+                try:
+                    if row.platform == "chatgpt":
+                        outcome = _retry_chatgpt_backfill(row, target=target, session=s, retries=3)
+                        ok = bool(outcome.get("ok"))
+                        skipped = bool(outcome.get("skipped"))
+                        msg = str(outcome.get("message") or "")
+                        if skipped:
+                            summary["skipped"] += 1
+                            _task_log(task_id, f"[SKIP] {row.email} {msg}")
+                        elif ok:
+                            summary["success"] += 1
+                            _task_log(task_id, f"[OK] {row.email} {msg}")
+                        else:
+                            summary["failed"] += 1
+                            errors.append(f"{row.email}: {msg}")
+                            _task_log(task_id, f"[FAIL] {row.email} {msg}")
+                    else:
+                        summary["skipped"] += 1
+                        _task_log(task_id, f"[SKIP] {row.email} 非 chatgpt 账号")
+                except Exception as exc:
+                    s.rollback()
+                    summary["failed"] += 1
+                    errors.append(f"{row.email}: {exc}")
+                    _task_log(task_id, f"[FAIL] {row.email} {exc}")
+                summary["total"] += 1
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+    _finish_async_task(task_id, success=summary["success"], skipped=summary["skipped"], errors=errors)
+
+
+@router.post("/backfill/start")
+def start_backfill_integrations(body: BackfillRequest, background_tasks: BackgroundTasks):
+    with Session(engine) as s:
+        q = select(func.count()).select_from(AccountModel)
+        targets = set(body.platforms or [])
+        if body.account_ids:
+            q = q.where(AccountModel.id.in_(body.account_ids))
+            if targets:
+                q = q.where(AccountModel.platform.in_(targets))
+        elif targets:
+            q = q.where(AccountModel.platform.in_(targets))
+        if body.status:
+            q = q.where(AccountModel.status == body.status)
+        if body.email:
+            q = q.where(AccountModel.email.contains(body.email))
+        total = int(s.exec(q).one() or 0)
+
+    task_id = _create_async_task(
+        platform=f"integration_backfill_{str(body.target or 'cliproxyapi').strip().lower() or 'cliproxyapi'}",
+        total=total,
+        source="manual_integration_backfill",
+        meta={"request": body.model_dump()},
+    )
+    background_tasks.add_task(_run_backfill_integrations_task, task_id, body)
+    return {"task_id": task_id}
