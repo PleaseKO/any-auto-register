@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GROUP_IDS = [2]
 DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+REMOTE_NAMES_CACHE_TTL_SECONDS = 60
+_remote_names_cache: dict[str, tuple[float, set[str]]] = {}
 
 
 def _get_config_value(key: str) -> str:
@@ -132,6 +134,60 @@ def _build_sub2api_account_payload(account, group_ids: list[int] | None = None) 
     }
 
 
+def _cache_key(api_url: str, api_key: str) -> str:
+    return f"{api_url.rstrip('/')}|{api_key}"
+
+
+def _fetch_remote_names(
+    *,
+    api_url: str,
+    api_key: str,
+    timeout: int = 30,
+    page_size: int = 200,
+) -> set[str]:
+    cache_key = _cache_key(api_url, api_key)
+    now = time.time()
+    cached = _remote_names_cache.get(cache_key)
+    if cached and now - cached[0] < REMOTE_NAMES_CACHE_TTL_SECONDS:
+        return set(cached[1])
+
+    base = f"{api_url.rstrip('/')}/api/v1/admin/accounts"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "x-api-key": api_key,
+    }
+    names: set[str] = set()
+    pages = 1
+
+    for page in range(1, pages + 1):
+        response = cffi_requests.get(
+            f"{base}?page={page}&page_size={int(page_size)}",
+            headers=headers,
+            proxies=None,
+            verify=False,
+            timeout=timeout,
+            impersonate="chrome110",
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"拉取远端账号列表失败: HTTP {response.status_code} {response.text[:160]}")
+        payload = response.json() if response.content else {}
+        data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+        try:
+            pages = max(int(data.get("pages") or 1), pages)
+        except Exception:
+            pages = max(1, pages)
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                names.add(name)
+
+    _remote_names_cache[cache_key] = (now, set(names))
+    return names
+
+
 def upload_to_sub2api(
     account,
     api_url: str | None = None,
@@ -151,6 +207,7 @@ def upload_to_sub2api(
         return False, "Sub2API API Key 未配置"
 
     payload = _build_sub2api_account_payload(account, group_ids=resolved_group_ids)
+    email_name = str(payload.get("name") or "").strip()
     url = f"{api_url.rstrip('/')}/api/v1/admin/accounts"
     headers = {
         "Content-Type": "application/json",
@@ -160,6 +217,15 @@ def upload_to_sub2api(
     }
 
     try:
+        if email_name:
+            remote_names = _fetch_remote_names(
+                api_url=api_url,
+                api_key=api_key,
+                timeout=timeout,
+            )
+            if email_name in remote_names:
+                return True, "远端已存在，跳过上传"
+
         response = cffi_requests.post(
             url,
             headers=headers,
@@ -171,6 +237,11 @@ def upload_to_sub2api(
         )
 
         if response.status_code in (200, 201):
+            if email_name:
+                cache_key = _cache_key(api_url, api_key)
+                cached = _remote_names_cache.get(cache_key)
+                if cached:
+                    cached[1].add(email_name)
             return True, "上传成功"
 
         error_msg = f"上传失败: HTTP {response.status_code}"
