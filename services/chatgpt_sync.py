@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlmodel import Session
 
 from core.db import AccountModel, engine
+from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_account_state import apply_chatgpt_status_policy
 
 CPA_SYNC_NAME = "cpa"
@@ -31,6 +33,27 @@ def _get_config_value(key: str, default: str = "") -> str:
         return value or default
     except Exception:
         return default
+
+
+def _resolve_status_probe_proxy() -> str | None:
+    candidates = [
+        _get_config_value("chatgpt_probe_proxy"),
+        _get_config_value("status_probe_proxy"),
+        _get_config_value("proxy"),
+        os.getenv("CHATGPT_PROBE_PROXY", ""),
+        os.getenv("STATUS_PROBE_PROXY", ""),
+        os.getenv("HTTPS_PROXY", ""),
+        os.getenv("https_proxy", ""),
+        os.getenv("HTTP_PROXY", ""),
+        os.getenv("http_proxy", ""),
+        os.getenv("ALL_PROXY", ""),
+        os.getenv("all_proxy", ""),
+    ]
+    for value in candidates:
+        proxy = normalize_proxy_url(value)
+        if proxy:
+            return proxy
+    return None
 
 
 def _resolve_cliproxy_target(api_url: str | None = None, api_key: str | None = None) -> tuple[str | None, str | None]:
@@ -291,6 +314,53 @@ def _local_probe_uploadable(probe: dict[str, Any]) -> bool:
     return str(auth.get("state") or "").strip() == "access_token_valid"
 
 
+def _probe_failed_but_upload_maybe_possible(probe: dict[str, Any]) -> bool:
+    auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
+    state = str(auth.get("state") or "").strip().lower()
+    return state in {"probe_failed", "unknown"}
+
+
+def _safe_probe_local_chatgpt_status(account: Any, *, proxy: str | None) -> dict[str, Any]:
+    from platforms.chatgpt.status_probe import probe_local_chatgpt_status
+
+    try:
+        return probe_local_chatgpt_status(account, proxy=proxy)
+    except Exception as exc:
+        now = _utcnow_iso()
+        return {
+            "version": 1,
+            "checked_at": now,
+            "auth": {
+                "state": "probe_failed",
+                "checked_at": now,
+                "source": "backend_me",
+                "http_status": 0,
+                "error_code": "",
+                "message": f"本地状态探测异常: {exc}",
+                "refresh_available": bool(
+                    getattr(account, "refresh_token", "") or getattr(account, "session_token", "")
+                ),
+            },
+            "subscription": {
+                "plan": "unknown",
+                "checked_at": now,
+                "source": "backend_me",
+                "workspace_plan_type": "",
+                "subscription_active_until": "",
+                "chatgpt_account_id": str(getattr(account, "user_id", "") or "").strip(),
+            },
+            "codex": {
+                "state": "not_checked",
+                "checked_at": now,
+                "source": "wham_usage",
+                "http_status": 0,
+                "error_code": "",
+                "message": "状态探测失败，未执行 Codex 探测",
+                "chatgpt_account_id": str(getattr(account, "user_id", "") or "").strip(),
+            },
+        }
+
+
 def _remote_state_label(sync_result: dict[str, Any]) -> str:
     value = str(sync_result.get("remote_state") or sync_result.get("status") or "").strip()
     return value or "unknown"
@@ -382,10 +452,10 @@ def _sub2api_missing(sync_result: dict[str, Any]) -> bool:
 def backfill_chatgpt_account_to_sub2api(
     account: AccountModel,
     *,
+    group_ids: list[int] | None = None,
     session: Session | None = None,
     commit: bool = True,
 ) -> dict[str, Any]:
-    from platforms.chatgpt.status_probe import probe_local_chatgpt_status
     from platforms.chatgpt.sub2api_upload import upload_to_sub2api
 
     results: list[dict[str, Any]] = []
@@ -399,18 +469,22 @@ def backfill_chatgpt_account_to_sub2api(
             session.refresh(account)
         return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
 
-    probe = probe_local_chatgpt_status(build_chatgpt_sync_account(account), proxy=None)
+    sync_account = build_chatgpt_sync_account(account)
+    probe = _safe_probe_local_chatgpt_status(sync_account, proxy=_resolve_status_probe_proxy())
     update_account_model_local_probe(account, probe, session=session, commit=False)
     if not _local_probe_uploadable(probe):
         auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
         msg = auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
-        results.append({"name": "本地状态探测", "ok": False, "msg": msg})
-        if session is not None and commit:
-            session.commit()
-            session.refresh(account)
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+        if _probe_failed_but_upload_maybe_possible(probe) and getattr(sync_account, "access_token", ""):
+            results.append({"name": "本地状态探测", "ok": False, "msg": f"{msg}；已跳过探测校验，继续上传"})
+        else:
+            results.append({"name": "本地状态探测", "ok": False, "msg": msg})
+            if session is not None and commit:
+                session.commit()
+                session.refresh(account)
+            return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
-    ok, msg = upload_to_sub2api(build_chatgpt_sync_account(account))
+    ok, msg = upload_to_sub2api(sync_account, group_ids=group_ids)
     update_account_model_sub2api_sync(account, ok, msg, session=session, commit=False)
     results.append({"name": "Sub2API 上传", "ok": ok, "msg": msg})
     if session is not None and commit:

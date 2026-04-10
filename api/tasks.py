@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
+MAX_REGISTER_CONCURRENCY = 30
+HIGH_CONCURRENCY_THRESHOLD = 10
+VERY_HIGH_CONCURRENCY_THRESHOLD = 20
+AUTO_START_INTERVAL_HIGH = 0.2
+AUTO_START_INTERVAL_VERY_HIGH = 0.35
+SUB2API_AUTO_BATCH_SIZE = 5
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -296,6 +302,19 @@ def _auto_upload_integrations(task_id: str, account):
         _log(task_id, f"  [Auto Upload] 自动导入异常: {e}")
 
 
+def _auto_upload_integrations_without_sub2api(task_id: str, account):
+    try:
+        from services.external_sync import sync_account
+
+        for result in sync_account(account, skip_sub2api=True):
+            name = result.get("name", "Auto Upload")
+            ok = bool(result.get("ok"))
+            msg = result.get("msg", "")
+            _log(task_id, f"  [{name}] {'[OK] ' + msg if ok else '[FAIL] ' + msg}")
+    except Exception as e:
+        _log(task_id, f"  [Auto Upload] 自动导入异常: {e}")
+
+
 def _run_register(task_id: str, req: RegisterTaskRequest):
     from core.registry import get
     from core.base_platform import RegisterConfig
@@ -310,6 +329,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     errors = []
     start_gate_lock = threading.Lock()
     next_start_time = time.time()
+    pending_sub2api_accounts: list = []
+    sub2api_buffer_lock = threading.Lock()
+    sub2api_flush_lock = threading.Lock()
+    auto_start_interval = 0.0
+    if req.concurrency >= VERY_HIGH_CONCURRENCY_THRESHOLD:
+        auto_start_interval = AUTO_START_INTERVAL_VERY_HIGH
+    elif req.concurrency >= HIGH_CONCURRENCY_THRESHOLD:
+        auto_start_interval = AUTO_START_INTERVAL_HIGH
+    effective_start_interval = max(float(req.register_delay_seconds or 0), auto_start_interval)
 
     def _sleep_with_control(
         wait_seconds: float,
@@ -325,6 +353,54 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
     try:
         PlatformCls = get(req.platform)
+
+        if auto_start_interval > 0:
+            _log(
+                task_id,
+                f"高并发保护已启用: 请求并发={req.concurrency}，实际启动间隔={effective_start_interval:g} 秒",
+            )
+
+        def _sub2api_batch_enabled() -> bool:
+            from services.external_sync import _resolve_sub2api_config
+
+            enabled, sub2api_url, sub2api_key = _resolve_sub2api_config()
+            return bool(req.platform == "chatgpt" and enabled and sub2api_url and sub2api_key)
+
+        sub2api_batch_enabled = _sub2api_batch_enabled()
+        if sub2api_batch_enabled:
+            _log(task_id, f"Sub2API 批次导入已启用: 每 {SUB2API_AUTO_BATCH_SIZE} 个账号触发一次上传")
+
+        def _flush_sub2api_batch(batch_accounts: list, *, reason: str) -> None:
+            if not batch_accounts:
+                return
+            try:
+                from services.external_sync import sync_accounts_to_sub2api
+
+                _log(task_id, f"  [Sub2API] 开始批次导入 {len(batch_accounts)} 个账号 ({reason})")
+                with sub2api_flush_lock:
+                    results = sync_accounts_to_sub2api(batch_accounts, max_workers=min(5, len(batch_accounts)))
+                for result in results:
+                    email = str(result.get("email") or "").strip()
+                    ok = bool(result.get("ok"))
+                    msg = str(result.get("msg") or "")
+                    if email:
+                        _log(task_id, f"  [Sub2API] {'[OK]' if ok else '[FAIL]'} {email} {msg}")
+                    else:
+                        _log(task_id, f"  [Sub2API] {'[OK]' if ok else '[FAIL]'} {msg}")
+            except Exception as exc:
+                _log(task_id, f"  [Sub2API] 批次导入异常: {exc}")
+
+        def _enqueue_sub2api_account(account) -> None:
+            if not sub2api_batch_enabled:
+                return
+            batch: list = []
+            with sub2api_buffer_lock:
+                pending_sub2api_accounts.append(account)
+                if len(pending_sub2api_accounts) >= SUB2API_AUTO_BATCH_SIZE:
+                    batch = pending_sub2api_accounts[:SUB2API_AUTO_BATCH_SIZE]
+                    del pending_sub2api_accounts[:SUB2API_AUTO_BATCH_SIZE]
+            if batch:
+                _flush_sub2api_batch(batch, reason="达到批次阈值")
 
         def _build_mailbox(proxy: Optional[str]):
             from core.config_store import config_store
@@ -357,7 +433,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if not _proxy:
                     _proxy = proxy_pool.get_next()
                 _proxy = normalize_proxy_url(_proxy)
-                if req.register_delay_seconds > 0:
+                if effective_start_interval > 0:
                     with start_gate_lock:
                         control.checkpoint(attempt_id=attempt_id)
                         now = time.time()
@@ -371,7 +447,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 wait_seconds,
                                 attempt_id=attempt_id,
                             )
-                        next_start_time = time.time() + req.register_delay_seconds
+                        next_start_time = time.time() + effective_start_interval
                 control.checkpoint(attempt_id=attempt_id)
                 from core.config_store import config_store
 
@@ -446,7 +522,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         password=account.password,
                     ),
                 )
-                _auto_upload_integrations(task_id, saved_account or account)
+                _auto_upload_integrations_without_sub2api(task_id, saved_account or account)
+                _enqueue_sub2api_account(saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
@@ -511,7 +588,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 
-        max_workers = min(req.concurrency, req.count, 20)
+        max_workers = min(req.concurrency, req.count, MAX_REGISTER_CONCURRENCY)
         stopped = False
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
@@ -543,6 +620,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     for pending in futures:
                         if pending is not f:
                             pending.cancel()
+        if sub2api_batch_enabled:
+            remaining_batch: list = []
+            with sub2api_buffer_lock:
+                if pending_sub2api_accounts:
+                    remaining_batch = list(pending_sub2api_accounts)
+                    pending_sub2api_accounts.clear()
+            if remaining_batch:
+                _flush_sub2api_batch(remaining_batch, reason="任务收尾")
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(

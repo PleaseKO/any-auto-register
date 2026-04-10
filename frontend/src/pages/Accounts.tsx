@@ -69,6 +69,21 @@ function parseExtraJson(raw: string | undefined) {
   }
 }
 
+function parseGroupIdsInput(raw: unknown): number[] {
+  return String(raw ?? '')
+    .split(',')
+    .map((item) => Number(String(item).trim()))
+    .filter((value) => Number.isInteger(value) && value > 0)
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = []
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size))
+  }
+  return chunks
+}
+
 function normalizeAccount(account: any) {
   const extra = parseExtraJson(account.extra_json)
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
@@ -372,6 +387,9 @@ function CliproxySyncSummary({ sync }: { sync: any }) {
 }
 
 function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => void; actions: any[] }) {
+  const [actionForm] = Form.useForm()
+  const [paramModalOpen, setParamModalOpen] = useState(false)
+  const [pendingAction, setPendingAction] = useState<any>(null)
   const [resultOpen, setResultOpen] = useState(false)
   const [resultTitle, setResultTitle] = useState('')
   const [resultStatus, setResultStatus] = useState<'success' | 'error'>('success')
@@ -400,13 +418,13 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
     }
   }
 
-  const handleAction = async (actionId: string) => {
+  const executeAction = async (actionId: string, params: Record<string, any>) => {
     const actionLabel = actions.find((item) => item.id === actionId)?.label || actionId
 
     try {
       const r = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}`, {
         method: 'POST',
-        body: JSON.stringify({ params: {} }),
+        body: JSON.stringify({ params }),
       })
       if (!r.ok) {
         const data = r.data || {}
@@ -445,6 +463,31 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
     }
   }
 
+  const handleAction = async (actionId: string) => {
+    const action = actions.find((item) => item.id === actionId)
+    const paramsDef = Array.isArray(action?.params) ? action.params : []
+    if (paramsDef.length > 0) {
+      setPendingAction(action)
+      actionForm.resetFields()
+      setParamModalOpen(true)
+      return
+    }
+    await executeAction(actionId, {})
+  }
+
+  const submitActionWithParams = async () => {
+    if (!pendingAction) return
+    const values = await actionForm.validateFields()
+    const params = { ...values }
+    if (Object.prototype.hasOwnProperty.call(params, 'group_ids')) {
+      params.group_ids = parseGroupIdsInput(params.group_ids)
+    }
+    setParamModalOpen(false)
+    setPendingAction(null)
+    actionForm.resetFields()
+    await executeAction(String(pendingAction.id), params)
+  }
+
   const menuItems: MenuProps['items'] = actions.map((a) => ({
     key: a.id,
     label: a.label,
@@ -454,6 +497,39 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
 
   return (
     <>
+      <Modal
+        title={pendingAction?.label || '填写参数'}
+        open={paramModalOpen}
+        onCancel={() => {
+          setParamModalOpen(false)
+          setPendingAction(null)
+          actionForm.resetFields()
+        }}
+        onOk={submitActionWithParams}
+        maskClosable={false}
+      >
+        <Form form={actionForm} layout="vertical">
+          {(Array.isArray(pendingAction?.params) ? pendingAction.params : []).map((param: any) => {
+            const key = String(param?.key || '')
+            const label = String(param?.label || key)
+            const type = String(param?.type || 'text')
+            if (type === 'select') {
+              return (
+                <Form.Item key={key} name={key} label={label}>
+                  <Select
+                    options={Array.isArray(param?.options) ? param.options.map((item: any) => ({ value: item, label: item })) : []}
+                  />
+                </Form.Item>
+              )
+            }
+            return (
+              <Form.Item key={key} name={key} label={label}>
+                <Input placeholder={key === 'group_ids' ? '多个分组用英文逗号分隔，例如 3,4,5' : ''} />
+              </Form.Item>
+            )
+          })}
+        </Form>
+      </Modal>
       <Dropdown
         menu={{
           items: menuItems,
@@ -566,6 +642,7 @@ export default function Accounts() {
   const [sub2apiProgressOpen, setSub2apiProgressOpen] = useState(false)
   const [sub2apiProgressRunning, setSub2apiProgressRunning] = useState(false)
   const [sub2apiProgress, setSub2apiProgress] = useState({ total: 0, current: 0, currentEmail: '' })
+  const [sub2apiGroupIdsInput, setSub2apiGroupIdsInput] = useState('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
   const persistRegisterTaskSnapshot = useCallback((nextTaskId: string | null, platformName: string) => {
@@ -823,12 +900,35 @@ export default function Accounts() {
     if (!importText.trim()) return
     setImportLoading(true)
     try {
-      const lines = importText.trim().split('\n').filter(Boolean)
-      const res = await apiFetch('/accounts/import', {
-        method: 'POST',
-        body: JSON.stringify({ platform: currentPlatform, lines }),
-      })
-      message.success(`导入成功 ${res.created} 个`)
+      const lines = importText
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+      const chunkSize = 200
+      const chunks = chunkArray(lines, chunkSize)
+
+      let created = 0
+      let invalid = 0
+      let duplicateInRequest = 0
+      let duplicateExisting = 0
+
+      for (let index = 0; index < chunks.length; index += 1) {
+        const chunk = chunks[index]
+        const res = await apiFetch('/accounts/import', {
+          method: 'POST',
+          body: JSON.stringify({ platform: currentPlatform, lines: chunk }),
+        })
+        created += Number(res.created || 0)
+        invalid += Number(res.invalid || 0)
+        duplicateInRequest += Number(res.duplicate_in_request || 0)
+        duplicateExisting += Number(res.duplicate_existing || 0)
+      }
+
+      const parts = [`导入成功 ${created} 个`]
+      if (duplicateExisting > 0) parts.push(`已存在 ${duplicateExisting} 个`)
+      if (duplicateInRequest > 0) parts.push(`批次内重复 ${duplicateInRequest} 个`)
+      if (invalid > 0) parts.push(`无效行 ${invalid} 个`)
+      message.success(parts.join('，'))
       setImportModalOpen(false)
       setImportText('')
       load()
@@ -1104,6 +1204,10 @@ export default function Accounts() {
     const body: Record<string, unknown> = {
       platforms: ['chatgpt'],
       target,
+    }
+    const parsedGroupIds = parseGroupIdsInput(sub2apiGroupIdsInput)
+    if (target === 'sub2api' && parsedGroupIds.length > 0) {
+      body.group_ids = parsedGroupIds
     }
 
     if (mode === 'selected') {
@@ -1494,6 +1598,15 @@ export default function Accounts() {
     <div>
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
         <Space>
+          {currentPlatform === 'chatgpt' && (
+            <Input
+              placeholder="Sub2API 分组 ID，如 3,4,5"
+              allowClear
+              value={sub2apiGroupIdsInput}
+              onChange={(e) => setSub2apiGroupIdsInput(e.target.value)}
+              style={{ width: 220 }}
+            />
+          )}
           <Input.Search
             placeholder="搜索邮箱..."
             allowClear
@@ -1639,7 +1752,7 @@ export default function Accounts() {
               <Input type="number" min={1} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={20} />
+              <Input type="number" min={1} max={30} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
@@ -1788,6 +1901,9 @@ export default function Accounts() {
       >
         <p style={{ marginBottom: 8, fontSize: 12, color: '#7a8ba3' }}>
           每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email password [cashier_url]</code>
+        </p>
+        <p style={{ marginBottom: 8, fontSize: 12, color: '#7a8ba3' }}>
+          前端会自动按小批次分段导入，避免单次请求体过大；重复邮箱会自动跳过。
         </p>
         <Input.TextArea
           value={importText}

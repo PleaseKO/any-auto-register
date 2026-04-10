@@ -240,6 +240,7 @@ class ChatGPTPlatform(BasePlatform):
                 "params": [
                     {"key": "api_url", "label": "Sub2API API URL", "type": "text"},
                     {"key": "api_key", "label": "Sub2API API Key", "type": "text"},
+                    {"key": "group_ids", "label": "分组 ID", "type": "text"},
                 ],
             },
             {
@@ -371,6 +372,7 @@ class ChatGPTPlatform(BasePlatform):
                 a,
                 api_url=params.get("api_url"),
                 api_key=params.get("api_key"),
+                group_ids=params.get("group_ids"),
             )
             return {"ok": ok, "data": msg}
 

@@ -32,6 +32,24 @@ class ImportRequest(BaseModel):
     lines: list[str]
 
 
+def _normalize_import_line(line: str) -> tuple[str, str, str] | None:
+    parts = str(line or "").strip().split(maxsplit=2)
+    if len(parts) < 2:
+        return None
+    email, password = parts[0].strip(), parts[1].strip()
+    if not email or not password:
+        return None
+    extra = parts[2].strip() if len(parts) > 2 else ""
+    if extra:
+        try:
+            json.loads(extra)
+        except (json.JSONDecodeError, ValueError):
+            extra = "{}"
+    else:
+        extra = "{}"
+    return email, password, extra
+
+
 class BatchDeleteRequest(BaseModel):
     ids: list[int]
 
@@ -192,26 +210,54 @@ def import_accounts(
     session: Session = Depends(get_session),
 ):
     """批量导入，每行格式: email password [extra]"""
-    created = 0
+    max_lines_per_request = 500
+    if len(body.lines) > max_lines_per_request:
+        raise HTTPException(400, f"单次最多导入 {max_lines_per_request} 行，请分批提交")
+
+    normalized_rows: list[tuple[str, str, str]] = []
+    invalid = 0
+    duplicate_in_request = 0
+    seen_emails: set[str] = set()
     for line in body.lines:
-        parts = line.strip().split()
-        if len(parts) < 2:
+        parsed = _normalize_import_line(line)
+        if not parsed:
+            invalid += 1
             continue
-        email, password = parts[0], parts[1]
-        extra = parts[2] if len(parts) > 2 else ""
-        if extra:
-            try:
-                json.loads(extra)
-            except (json.JSONDecodeError, ValueError):
-                extra = "{}"
-        else:
-            extra = "{}"
-        acc = AccountModel(platform=body.platform, email=email,
-                           password=password, extra_json=extra)
+        email, password, extra = parsed
+        dedup_key = f"{body.platform}:{email.lower()}"
+        if dedup_key in seen_emails:
+            duplicate_in_request += 1
+            continue
+        seen_emails.add(dedup_key)
+        normalized_rows.append((email, password, extra))
+
+    if not normalized_rows:
+        return {"created": 0, "invalid": invalid, "duplicate_in_request": duplicate_in_request, "duplicate_existing": 0}
+
+    existing_rows = session.exec(
+        select(AccountModel.email).where(
+            AccountModel.platform == body.platform,
+            AccountModel.email.in_([email for email, _, _ in normalized_rows]),
+        )
+    ).all()
+    existing_emails = {str(email or "").lower() for email in existing_rows}
+
+    created = 0
+    duplicate_existing = 0
+    for email, password, extra in normalized_rows:
+        if email.lower() in existing_emails:
+            duplicate_existing += 1
+            continue
+        acc = AccountModel(platform=body.platform, email=email, password=password, extra_json=extra)
         session.add(acc)
         created += 1
     session.commit()
-    return {"created": created}
+    return {
+        "created": created,
+        "invalid": invalid,
+        "duplicate_in_request": duplicate_in_request,
+        "duplicate_existing": duplicate_existing,
+    }
 
 
 @router.post("/batch-delete")

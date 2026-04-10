@@ -328,7 +328,7 @@ export default function RegisterTaskPage() {
               <Input type="number" min={1} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
-              <Input type="number" min={1} max={20} />
+              <Input type="number" min={1} max={30} />
             </Form.Item>
           </Space>
           <Space style={{ width: '100%' }}>

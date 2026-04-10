@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from services.chatgpt_sync import (
@@ -19,29 +20,79 @@ def _is_config_enabled(value: Any, default: bool = False) -> bool:
     return normalized in {"1", "true", "yes", "on", "enabled"}
 
 
-def sync_account(account) -> list[dict[str, Any]]:
+def _build_chatgpt_upload_account(account):
+    class _A:
+        pass
+
+    a = _A()
+    a.email = account.email
+    extra = _get_account_extra(account)
+    a.access_token = extra.get("access_token") or account.token
+    a.refresh_token = extra.get("refresh_token", "")
+    a.id_token = extra.get("id_token", "")
+    a.session_token = extra.get("session_token", "")
+    a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
+    return a
+
+
+def _resolve_sub2api_config() -> tuple[bool, str, str]:
+    from core.config_store import config_store
+
+    sub2api_url = str(config_store.get("sub2api_api_url", "") or "").strip()
+    sub2api_key = str(config_store.get("sub2api_api_key", "") or "").strip()
+    sub2api_enabled = _is_config_enabled(
+        config_store.get("sub2api_enabled", ""),
+        default=bool(sub2api_url and sub2api_key),
+    )
+    return sub2api_enabled, sub2api_url, sub2api_key
+
+
+def sync_accounts_to_sub2api(accounts: list[Any], *, max_workers: int = 5) -> list[dict[str, Any]]:
+    enabled, sub2api_url, sub2api_key = _resolve_sub2api_config()
+    if not enabled or not sub2api_url or not sub2api_key:
+        return []
+
+    from platforms.chatgpt.sub2api_upload import upload_to_sub2api
+
+    def _worker(account: Any) -> dict[str, Any]:
+        upload_account = _build_chatgpt_upload_account(account)
+        ok, msg = upload_to_sub2api(
+            upload_account,
+            api_url=sub2api_url,
+            api_key=sub2api_key,
+        )
+        persist_sub2api_sync_result(account, ok, msg)
+        return {
+            "name": "Sub2API",
+            "ok": ok,
+            "msg": msg,
+            "email": str(getattr(account, "email", "") or "").strip(),
+        }
+
+    items = [account for account in accounts if getattr(account, "platform", "") == "chatgpt"]
+    if not items:
+        return []
+    if len(items) == 1:
+        return [_worker(items[0])]
+
+    results: list[dict[str, Any]] = []
+    pool_size = min(max_workers, len(items))
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        futures = [pool.submit(_worker, account) for account in items]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+
+def sync_account(account, *, skip_sub2api: bool = False) -> list[dict[str, Any]]:
     """根据平台将账号同步到外部系统。"""
     from core.config_store import config_store
 
     platform = getattr(account, "platform", "")
     results: list[dict[str, Any]] = []
 
-    def _build_chatgpt_upload_account():
-        class _A:
-            pass
-
-        a = _A()
-        a.email = account.email
-        extra = _get_account_extra(account)
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.id_token = extra.get("id_token", "")
-        a.session_token = extra.get("session_token", "")
-        a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
-        return a
-
     if platform == "chatgpt":
-        upload_account = _build_chatgpt_upload_account()
+        upload_account = _build_chatgpt_upload_account(account)
 
         # 贡献模式优先级最高：开启后仅上传到贡献服务器，避免重复上报到其它平台。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))
@@ -95,13 +146,8 @@ def sync_account(account) -> list[dict[str, Any]]:
                 results.append({"name": "CodexProxy(AT)", "ok": ok, "msg": msg})
 
         # 关键逻辑：ChatGPT 现在支持同时回填 CPA 和 Sub2API，互不覆盖、分别上报结果。
-        sub2api_url = str(config_store.get("sub2api_api_url", "") or "").strip()
-        sub2api_key = str(config_store.get("sub2api_api_key", "") or "").strip()
-        sub2api_enabled = _is_config_enabled(
-            config_store.get("sub2api_enabled", ""),
-            default=bool(sub2api_url and sub2api_key),
-        )
-        if sub2api_enabled and sub2api_url and sub2api_key:
+        sub2api_enabled, sub2api_url, sub2api_key = _resolve_sub2api_config()
+        if not skip_sub2api and sub2api_enabled and sub2api_url and sub2api_key:
             from platforms.chatgpt.sub2api_upload import upload_to_sub2api
 
             ok, msg = upload_to_sub2api(

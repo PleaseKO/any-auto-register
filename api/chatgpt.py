@@ -164,6 +164,7 @@ def upload_cpa(account_id: int, req: CpaUploadReq,
 class Sub2ApiUploadReq(BaseModel):
     api_url: str
     api_key: str = ""
+    group_ids: list[int] = []
 
 
 @router.post("/{account_id}/upload-sub2api")
@@ -178,5 +179,6 @@ def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
         codex_acc,
         api_url=req.api_url,
         api_key=req.api_key,
+        group_ids=req.group_ids or None,
     )
     return {"ok": ok, "message": msg}

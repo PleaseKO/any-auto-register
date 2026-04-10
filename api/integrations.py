@@ -27,6 +27,7 @@ class BackfillRequest(BaseModel):
     status: Optional[str] = None
     email: Optional[str] = None
     target: str = "cliproxyapi"
+    group_ids: list[int] = Field(default_factory=list)
 
 
 def _create_async_task(*, platform: str, total: int, source: str, meta: dict | None = None) -> str:
@@ -52,13 +53,20 @@ def _finish_async_task(task_id: str, *, success: int, skipped: int, errors: list
     _task_store.cleanup()
 
 
-def _retry_chatgpt_backfill(row: AccountModel, *, target: str, session: Session, retries: int = 3) -> dict:
+def _retry_chatgpt_backfill(
+    row: AccountModel,
+    *,
+    target: str,
+    session: Session,
+    group_ids: list[int] | None = None,
+    retries: int = 3,
+) -> dict:
     import time
 
     last_outcome: dict = {"ok": False, "message": "unknown", "results": []}
     for attempt in range(1, retries + 1):
         last_outcome = (
-            backfill_chatgpt_account_to_sub2api(row, session=session, commit=True)
+            backfill_chatgpt_account_to_sub2api(row, session=session, commit=True, group_ids=group_ids)
             if target == "sub2api"
             else backfill_chatgpt_account_to_cpa(row, session=session, commit=True)
         )
@@ -164,7 +172,12 @@ def backfill_integrations(body: BackfillRequest):
                 results = []
                 if row.platform == "chatgpt":
                     outcome = (
-                        backfill_chatgpt_account_to_sub2api(row, session=s, commit=True)
+                        backfill_chatgpt_account_to_sub2api(
+                            row,
+                            session=s,
+                            commit=True,
+                            group_ids=body.group_ids or None,
+                        )
                         if target == "sub2api"
                         else backfill_chatgpt_account_to_cpa(row, session=s, commit=True)
                     )
@@ -276,7 +289,13 @@ def _run_backfill_integrations_task(task_id: str, body: BackfillRequest) -> None
                     db_row = thread_session.get(AccountModel, account_id)
                     if not db_row:
                         return {"email": email, "status": "failed", "message": "账号不存在"}
-                    outcome = _retry_chatgpt_backfill(db_row, target=target, session=thread_session, retries=3)
+                    outcome = _retry_chatgpt_backfill(
+                        db_row,
+                        target=target,
+                        session=thread_session,
+                        group_ids=body.group_ids or None,
+                        retries=3,
+                    )
                     ok = bool(outcome.get("ok"))
                     skipped = bool(outcome.get("skipped"))
                     msg = str(outcome.get("message") or "")
@@ -319,7 +338,13 @@ def _run_backfill_integrations_task(task_id: str, body: BackfillRequest) -> None
             for index, row in enumerate(rows, start=1):
                 try:
                     if row.platform == "chatgpt":
-                        outcome = _retry_chatgpt_backfill(row, target=target, session=s, retries=3)
+                        outcome = _retry_chatgpt_backfill(
+                            row,
+                            target=target,
+                            session=s,
+                            group_ids=body.group_ids or None,
+                            retries=3,
+                        )
                         ok = bool(outcome.get("ok"))
                         skipped = bool(outcome.get("skipped"))
                         msg = str(outcome.get("message") or "")
